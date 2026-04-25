@@ -1,0 +1,43 @@
+.page {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 24px;
+  font-family: Arial, sans-serif;
+}
+
+.status {
+  margin-bottom: 12px;
+}
+
+.card {
+  border: 1px solid #ddd;
+  border-radius: 10px;
+  padding: 16px;
+  margin-top: 16px;
+}
+
+.grid {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+input,
+textarea,
+button {
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+}
+
+textarea {
+  min-height: 90px;
+}
+
+.item {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  border-top: 1px solid #eee;
+  padding: 10px 0;
+}
