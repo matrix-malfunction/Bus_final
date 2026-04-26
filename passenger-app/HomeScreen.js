@@ -46,6 +46,24 @@ const MiniMap = ({ buses, sosAlerts, userLocation, onPress }) => {
   <style>
     html, body, #map { height: 100%; margin: 0; }
     .bus-marker { font-size: 24px; }
+    .user-beacon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .beacon {
+      width: 12px;
+      height: 12px;
+      background: #007AFF;
+      border-radius: 50%;
+      box-shadow: 0 0 0 6px rgba(0,122,255,0.2);
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(0,122,255,0.5); }
+      70% { box-shadow: 0 0 0 12px rgba(0,122,255,0); }
+      100% { box-shadow: 0 0 0 0 rgba(0,122,255,0); }
+    }
   </style>
 </head>
 <body>
@@ -126,11 +144,18 @@ const MiniMap = ({ buses, sosAlerts, userLocation, onPress }) => {
         // Store for fallback
         window.userLocation = { lat, lng };
 
+        // Beacon-style user icon
+        const userIcon = L.divIcon({
+          className: "user-beacon",
+          html: '<div class="beacon"></div>',
+          iconSize: [20, 20]
+        });
+
         // Create or update marker
         if (window.userMarker) {
           window.userMarker.setLatLng([lat, lng]);
         } else {
-          window.userMarker = L.marker([lat, lng]).addTo(map);
+          window.userMarker = L.marker([lat, lng], { icon: userIcon }).addTo(map);
         }
 
         // Initial centering (first time only)
@@ -161,7 +186,7 @@ const MiniMap = ({ buses, sosAlerts, userLocation, onPress }) => {
         return;
       }
 
-      if (data.type === "BUS_DATA") {
+      if (data.type === "BUS_UPDATE") {
         if (!window.busMarkers) window.busMarkers = {};
         data.buses.forEach(bus => {
           const lat = Number(bus.latitude ?? bus.lat);
@@ -235,7 +260,7 @@ const MiniMap = ({ buses, sosAlerts, userLocation, onPress }) => {
   useEffect(() => {
     if (!webViewReady || buses.length === 0) return;
     webViewRef.current?.postMessage(JSON.stringify({
-      type: "BUS_DATA",
+      type: "BUS_UPDATE",
       buses: buses,
       sos: sosAlerts || [],  // Include SOS alerts
     }));

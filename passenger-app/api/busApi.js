@@ -49,15 +49,26 @@ async function fetchWithRetry(url, options = {}, timeout = 5000, retries = 2) {
 /**
  * Get buses near a location
  */
-export async function getNearbyBuses(lat, lng, radius = 5000, limit = 50) {
-  const url = `${API_BASE_URL}/buses/nearby?lat=${lat}&lng=${lng}&radius=${radius}&limit=${limit}`;
+export async function fetchNearbyBuses(lat, lng, radius = 5000, limit = 50) {
+  const url = `${API_BASE_URL}/api/buses/nearby?lat=${lat}&lng=${lng}&radius=${radius}&limit=${limit}`;
   
+  console.log("[API] Fetching:", url);
   const data = await fetchWithRetry(url);
+  console.log("[API RAW RESPONSE]:", JSON.stringify(data));
+  
+  // Validate response
+  if (!data.buses) {
+    console.warn("[API] Missing buses array in response");
+    return { meta: data.meta, buses: [] };
+  }
   
   // Expand compact format to full field names
+  const processedBuses = data.buses.map(expandBusData);
+  console.log("[API PROCESSED BUSES]:", processedBuses.length);
+  
   return {
     meta: data.meta,
-    buses: data.buses.map(expandBusData)
+    buses: processedBuses
   };
 }
 
@@ -223,6 +234,9 @@ export function sortByDistance(buses, userLat, userLng) {
     }))
     .sort((a, b) => a.distance - b.distance);
 }
+
+// Named export alias for compatibility
+export const getNearbyBuses = fetchNearbyBuses;
 
 // Default export
 export default {

@@ -1,5 +1,5 @@
-import { useMemo, useEffect, useRef } from "react";
-import { StyleSheet, View } from "react-native";
+import { useMemo, useEffect, useRef, useState } from "react";
+import { StyleSheet, View, TouchableOpacity, Text } from "react-native";
 import { WebView } from "react-native-webview";
 
 function escapeText(input) {
@@ -93,27 +93,23 @@ export default function FullMapScreen({ route }) {
         <style>
           html, body { margin:0; padding:0; height:100%; }
           #map { width:100%; height:100vh; }
-          .beacon {
-            width: 14px;
-            height: 14px;
-            background: #007bff;
-            border-radius: 50%;
-            position: relative;
+          .user-beacon {
+            display: flex;
+            align-items: center;
+            justify-content: center;
           }
-          .beacon::after {
-            content: "";
-            position: absolute;
-            width: 28px;
-            height: 28px;
-            background: rgba(0, 123, 255, 0.3);
+          .beacon {
+            width: 12px;
+            height: 12px;
+            background: #007AFF;
             border-radius: 50%;
-            top: -7px;
-            left: -7px;
+            box-shadow: 0 0 0 6px rgba(0,122,255,0.2);
             animation: pulse 1.5s infinite;
           }
           @keyframes pulse {
-            0% { transform: scale(0.5); opacity: 1; }
-            100% { transform: scale(2); opacity: 0; }
+            0% { box-shadow: 0 0 0 0 rgba(0,122,255,0.5); }
+            70% { box-shadow: 0 0 0 12px rgba(0,122,255,0); }
+            100% { box-shadow: 0 0 0 0 rgba(0,122,255,0); }
           }
         </style>
       </head>
@@ -207,11 +203,18 @@ export default function FullMapScreen({ route }) {
               // Store for fallback
               window.userLocation = { lat, lng };
 
+              // Beacon-style user icon
+              const userIcon = L.divIcon({
+                className: "user-beacon",
+                html: '<div class="beacon"></div>',
+                iconSize: [20, 20]
+              });
+
               // Create or update marker
               if (window.userMarker) {
                 window.userMarker.setLatLng([lat, lng]);
               } else {
-                window.userMarker = L.marker([lat, lng]).addTo(window.map);
+                window.userMarker = L.marker([lat, lng], { icon: userIcon }).addTo(window.map);
               }
 
               // Initial centering (first time only)
@@ -244,6 +247,33 @@ export default function FullMapScreen({ route }) {
 
             if (data.type === "BUS_DATA") {
               // Existing bus marker logic handled by markersScript
+            }
+
+            if (data.type === "RECENTER") {
+              if (!window.map) return;
+
+              let target = null;
+
+              if (window.userMarker) {
+                target = window.userMarker.getLatLng();
+              } else if (window.userLocation) {
+                target = [window.userLocation.lat, window.userLocation.lng];
+              }
+
+              if (!target) {
+                console.warn("No user location for recenter");
+                return;
+              }
+
+              const targetZoom = window.map.getZoom() < 15 ? 16 : window.map.getZoom();
+
+              window.map.flyTo(target, targetZoom, {
+                animate: true,
+                duration: 1.2
+              });
+
+              window.isFollowingUser = true;
+              console.log("[FOLLOW] Re-enabled by recenter");
             }
           }
 
@@ -298,12 +328,25 @@ export default function FullMapScreen({ route }) {
   useEffect(() => {
     if (!routeUserLocation || !webViewRef.current) return;
 
+    const lat = routeUserLocation?.lat ?? routeUserLocation?.latitude;
+    const lng = routeUserLocation?.lng ?? routeUserLocation?.longitude;
+    if (!lat || !lng) return;
+
     webViewRef.current.postMessage(JSON.stringify({
       type: "USER_LOCATION",
-      lat: routeUserLocation.latitude,
-      lng: routeUserLocation.longitude
+      lat: lat,
+      lng: lng
     }));
   }, [routeUserLocation]);
+
+  const [isRecentering, setIsRecentering] = useState(false);
+
+  const handleRecenter = () => {
+    if (!webViewRef.current) return;
+    setIsRecentering(true);
+    webViewRef.current.postMessage(JSON.stringify({ type: "RECENTER" }));
+    setTimeout(() => setIsRecentering(false), 800);
+  };
 
   return (
     <View style={styles.container}>
@@ -311,7 +354,18 @@ export default function FullMapScreen({ route }) {
         ref={webViewRef}
         originWhitelist={["*"]}
         source={{ html: mapHTML }}
+        javaScriptEnabled={true}
+        domStorageEnabled={true}
+        mixedContentMode="always"
+        style={{ flex: 1 }}
       />
+      <TouchableOpacity
+        style={[styles.recenterButton, isRecentering && styles.recenterButtonActive]}
+        onPress={handleRecenter}
+        activeOpacity={0.8}
+      >
+        <Text style={styles.recenterIcon}>📍</Text>
+      </TouchableOpacity>
     </View>
   );
 }
@@ -320,5 +374,25 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: "#fff",
+  },
+  recenterButton: {
+    position: 'absolute',
+    bottom: 20,
+    right: 20,
+    backgroundColor: '#fff',
+    borderRadius: 30,
+    padding: 12,
+    elevation: 6,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+  },
+  recenterButtonActive: {
+    backgroundColor: '#e0e0e0',
+    transform: [{ scale: 0.9 }],
+  },
+  recenterIcon: {
+    fontSize: 20,
   },
 });

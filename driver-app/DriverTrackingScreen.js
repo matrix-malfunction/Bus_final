@@ -6,6 +6,7 @@ import * as Location from "expo-location";
 import * as TaskManager from "expo-task-manager";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import NetInfo from "@react-native-community/netinfo";
+import { io } from "socket.io-client";
 
 // PRODUCTION BACKEND URL
 const API_BASE_URL = "https://bus-tracking-backend-6htm.onrender.com";
@@ -29,6 +30,8 @@ const TOKEN_KEY = "@auth_token";
 global.bgBusId = null;
 global.bgToken = null;
 global.bgLastLocation = null; // { latitude, longitude, timestamp }
+// SOS freeze state - stops location updates when SOS is active
+global.bgSosActive = false;
 
 // Constants for GPS filtering
 const DUPLICATE_THRESHOLD_METERS = 2; // Skip if moved less than 2m
@@ -110,6 +113,12 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
     // Skip if missing busId or token
     if (!busId || !token) {
       console.log("[BG TASK] Missing busId or token, skipping");
+      return;
+    }
+
+    // SOS FREEZE: Skip location updates when SOS is active
+    if (global.bgSosActive) {
+      console.log("[TRACKING] Paused due to active SOS");
       return;
     }
 
@@ -700,14 +709,72 @@ export default function DriverTrackingScreen({ token }) {
     }, [])
   );
 
+  const sosSendingRef = useRef(false);
+  const sosActiveRef = useRef(false);
+
+  // Function to clear SOS state (for future use)
+  const clearSOSState = useCallback(() => {
+    sosActiveRef.current = false;
+    global.bgSosActive = false;
+    console.log("[SOS STATE] Cleared - resuming tracking");
+  }, []);
+
+  // Auto-resume tracking when SOS is acknowledged (polling fallback)
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      if (!busId || !global.bgSosActive) return;
+
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/sos/status?busId=${busId}`);
+        const data = await res.json();
+
+        if (!data.active && global.bgSosActive) {
+          console.log("[SOS STATE] Backend cleared - resuming tracking");
+
+          global.bgSosActive = false;
+          sosActiveRef.current = false;
+        }
+      } catch (e) {
+        console.log("[SOS CHECK ERROR]", e.message);
+      }
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [busId]);
+
+  // Real-time SOS clear via Socket.IO (primary method)
+  useEffect(() => {
+    const socket = io(API_BASE_URL);
+
+    socket.on("sos:cleared", () => {
+      console.log("[SOS STATE] Realtime resume");
+
+      global.bgSosActive = false;
+      sosActiveRef.current = false;
+    });
+
+    return () => socket.disconnect();
+  }, []);
+
   const sendEmergency = useCallback(async () => {
-    // TEMP: Remove token check to isolate issue
-    // if (!token) {
-    //   setStatus("Missing token. Login first.");
-    //   return;
-    // }
+    // Prevent concurrent SOS calls
+    if (sosSendingRef.current) {
+      console.log("[EMERGENCY] Already sending, ignoring duplicate");
+      return;
+    }
+
+    // Check location available
+    if (!currentLocation) {
+      console.log("[EMERGENCY] No location available");
+      setStatus("Location not available");
+      return;
+    }
+
+    sosSendingRef.current = true;
+    console.log("[EMERGENCY] Starting SOS send...");
 
     const endpoint = `${API_BASE_URL}/api/sos`;
+    let response = null;  // Track for finally block
 
     try {
       console.log("[EMERGENCY] Attempting endpoint:", endpoint);
@@ -757,7 +824,18 @@ export default function DriverTrackingScreen({ token }) {
 
       if (response.ok) {
         console.log("[EMERGENCY] SUCCESS via:", endpoint);
-        setStatus("Emergency reported successfully via " + endpoint.split('/').pop());
+        setStatus("Emergency reported successfully");
+        
+        // Activate SOS freeze state
+        sosActiveRef.current = true;
+        global.bgSosActive = true;
+        console.log("[SOS STATE] Activated - stopping location updates");
+        
+        // Keep flag true briefly to prevent immediate re-trigger
+        setTimeout(() => {
+          sosSendingRef.current = false;
+          console.log("[EMERGENCY] Ready for next SOS");
+        }, 3000);
         return; // Success - exit function
       }
 
@@ -766,8 +844,20 @@ export default function DriverTrackingScreen({ token }) {
       setStatus("Network issue: " + (data?.message || `HTTP ${response.status}`));
 
     } catch (error) {
-      console.log("[EMERGENCY] Network error for", endpoint, ":", error.message);
-      setStatus("Network issue: " + error.message);
+      console.log("[EMERGENCY] ERROR:", error);
+
+      if (error && error.message) {
+        console.log("[EMERGENCY] Message:", error.message);
+        setStatus("Error: " + error.message);
+      } else {
+        console.log("[EMERGENCY] Unknown error");
+        setStatus("Unexpected error occurred");
+      }
+    } finally {
+      // Ensure flag is cleared on error path (success already has timeout)
+      if (!response || !response.ok) {
+        sosSendingRef.current = false;
+      }
     }
   }, [token, busId, currentLocation]);
 
