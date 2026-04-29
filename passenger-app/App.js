@@ -14,6 +14,7 @@ import ProfileScreen from "./ProfileScreen";
 import EmergencyScreen from "./EmergencyScreen";
 import PassengerLoginScreen from "./screens/PassengerLoginScreen";
 import { MapPreviewProvider } from "./MapPreviewContext";
+import { BusProvider } from "./BusContext";
 
 const Stack = createNativeStackNavigator();
 const Drawer = createDrawerNavigator();
@@ -103,14 +104,16 @@ export default function App() {
         {token ? (
           <Stack.Screen name="Main" options={{ headerShown: false }}>
             {() => (
-              <MapPreviewProvider>
-                <DrawerApp
-                  token={token}
-                  userName={userName}
-                  onLogout={handleLogout}
-                  renderHome={renderHome}
-                />
-              </MapPreviewProvider>
+              <BusProvider>
+                <MapPreviewProvider>
+                  <DrawerApp
+                    token={token}
+                    userName={userName}
+                    onLogout={handleLogout}
+                    renderHome={renderHome}
+                  />
+                </MapPreviewProvider>
+              </BusProvider>
             )}
           </Stack.Screen>
         ) : (

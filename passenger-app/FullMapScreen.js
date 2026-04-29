@@ -1,6 +1,7 @@
-import { useMemo, useEffect, useRef, useState } from "react";
+import { useMemo, useEffect, useRef, useState, useCallback } from "react";
 import { StyleSheet, View, TouchableOpacity, Text } from "react-native";
 import { WebView } from "react-native-webview";
+import { useBus } from "./BusContext";
 
 function escapeText(input) {
   return String(input ?? "Bus").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -13,6 +14,9 @@ function toFiniteCoordinate(value) {
 
 export default function FullMapScreen({ route }) {
   const webViewRef = useRef(null);
+  const lastUserLocationRef = useRef(null); // Cache for resend on WebView load
+  const [webViewReady, setWebViewReady] = useState(false);
+  const { buses: contextBuses } = useBus();
   const { buses: routeBuses, userLocation: routeUserLocation, center: routeCenter } = route?.params || {};
   const center =
     routeCenter &&
@@ -27,33 +31,124 @@ export default function FullMapScreen({ route }) {
       ? routeUserLocation
       : null;
 
-  // Continuous user location sync (every 3 seconds)
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (!webViewRef.current || !route.params?.userLocation) return;
+  // Handle MAP_READY from WebView - idempotent, always resend USER_LOCATION
+  const handleWebViewMessage = useCallback((event) => {
+    try {
+      if (!event?.nativeEvent?.data) return;
+      const data = JSON.parse(event.nativeEvent.data);
+      if (!data?.type) return;
 
-      webViewRef.current.postMessage(JSON.stringify({
-        type: "USER_LOCATION",
-        lat: route.params.userLocation.latitude,
-        lng: route.params.userLocation.longitude
-      }));
+      // Idempotent MAP_READY handling - safe for duplicates
+      if (data.type === "MAP_READY") {
+        const alreadyReady = webViewReady;
+        console.log("[FullMap] MAP_READY received (alreadyReady:", alreadyReady, ")");
+        
+        // Always mark as ready (idempotent)
+        if (!alreadyReady) {
+          setWebViewReady(true);
+        }
+
+        // ALWAYS resend cached user location on MAP_READY (recovery mechanism)
+        if (lastUserLocationRef.current && webViewRef.current) {
+          webViewRef.current.postMessage(JSON.stringify({
+            type: "USER_LOCATION",
+            payload: lastUserLocationRef.current
+          }));
+          console.log("[FullMap] USER_LOCATION resent on MAP_READY");
+        }
+
+        // ALWAYS resend BUS_UPDATE on MAP_READY (recovery mechanism)
+        if (webViewRef.current) {
+          console.log("[FullMap] Sending BUS_UPDATE on MAP_READY:", buses.length, "buses");
+          webViewRef.current.postMessage(
+            JSON.stringify({
+              type: "BUS_UPDATE",
+              buses: buses
+            })
+          );
+        }
+      }
+      
+      // PING → MAP_READY recovery (optional handshake)
+      if (data.type === "PING") {
+        console.log("[FullMap] PING received, responding with PONG");
+        webViewRef.current?.postMessage(JSON.stringify({ type: "PONG" }));
+      }
+    } catch (e) {
+      console.log("[FullMap] Invalid message:", e.message);
+    }
+  }, [webViewReady, buses]);
+
+  // Continuous user location sync (every 3 seconds)
+  // Standardized schema: { type: "USER_LOCATION", payload: { latitude, longitude } }
+  useEffect(() => {
+    // Cache initial user location
+    if (route.params?.userLocation) {
+      lastUserLocationRef.current = {
+        latitude: route.params.userLocation.latitude,
+        longitude: route.params.userLocation.longitude
+      };
+    }
+
+    const interval = setInterval(() => {
+      if (!route.params?.userLocation) return;
+
+      // Update cache
+      lastUserLocationRef.current = {
+        latitude: route.params.userLocation.latitude,
+        longitude: route.params.userLocation.longitude
+      };
+
+      // Send if WebView ready
+      if (webViewRef.current && webViewReady) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "USER_LOCATION",
+          payload: lastUserLocationRef.current
+        }));
+      }
     }, 3000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [webViewReady, route.params?.userLocation]);
 
-  const buses = useMemo(
-    () =>
-      (Array.isArray(routeBuses) ? routeBuses : [])
-        .map((bus) => {
-          const latitude = toFiniteCoordinate(bus?.latitude);
-          const longitude = toFiniteCoordinate(bus?.longitude);
-          if (latitude === null || longitude === null) return null;
-          return { ...bus, latitude, longitude };
-        })
-        .filter(Boolean),
-    [routeBuses]
-  );
+  // Send BUS_UPDATE to WebView whenever buses change
+  // ALWAYS send (even empty) to clear stale markers
+  useEffect(() => {
+    if (!webViewRef.current || !webViewReady) return;
+
+    console.log("[FullMap RN] Sending BUS_UPDATE:", buses.length, "buses");
+    webViewRef.current.postMessage(
+      JSON.stringify({
+        type: "BUS_UPDATE",
+        buses: buses
+      })
+    );
+  }, [buses, webViewReady]);
+
+  // Convert context buses (object) to array and merge with route buses
+  const buses = useMemo(() => {
+    const contextBusesArray = Object.values(contextBuses || {});
+    const routeBusesArray = Array.isArray(routeBuses) ? routeBuses : [];
+    
+    // Use context buses if available, otherwise fall back to route buses
+    const sourceBuses = contextBusesArray.length > 0 ? contextBusesArray : routeBusesArray;
+    
+    return sourceBuses
+      .map((bus) => {
+        const latitude = toFiniteCoordinate(bus?.latitude ?? bus?.lat);
+        const longitude = toFiniteCoordinate(bus?.longitude ?? bus?.lng);
+        if (latitude === null || longitude === null) return null;
+        return { 
+          ...bus, 
+          latitude, 
+          longitude,
+          lat: latitude,
+          lng: longitude,
+          busId: bus.busId || bus._id
+        };
+      })
+      .filter(Boolean);
+  }, [routeBuses, contextBuses]);
 
   const markersScript = useMemo(
     () =>
@@ -141,6 +236,48 @@ export default function FullMapScreen({ route }) {
           window.lastFollowLatLng = null;
           window.hasInitialCentered = false;
 
+          // Hardened MAP_READY delivery - multiple safeguards
+          window.__MAP_READY_SENT__ = false;
+          
+          function sendMapReady() {
+            if (window.__MAP_READY_SENT__) return; // Idempotent
+            if (!window.ReactNativeWebView) {
+              console.log("[WEBVIEW] ReactNativeWebView not available");
+              return;
+            }
+            
+            window.ReactNativeWebView.postMessage(
+              JSON.stringify({ type: "MAP_READY" })
+            );
+            window.__MAP_READY_SENT__ = true;
+            console.log("[WEBVIEW] MAP_READY sent (idempotent)");
+          }
+          
+          // Primary: Send when map is ready
+          window.map.whenReady(function() {
+            sendMapReady();
+          });
+          
+          // Fallback 1: 1 second timeout in case whenReady fails
+          setTimeout(function() {
+            if (!window.__MAP_READY_SENT__) {
+              console.log("[WEBVIEW] Fallback timeout triggered");
+              sendMapReady();
+            }
+          }, 1000);
+          
+          // Fallback 2: DOM ready as last resort
+          if (document.readyState === "complete") {
+            sendMapReady();
+          } else {
+            document.addEventListener("DOMContentLoaded", function() {
+              if (!window.__MAP_READY_SENT__) {
+                console.log("[WEBVIEW] DOMContentLoaded fallback");
+                sendMapReady();
+              }
+            });
+          }
+
           // Disable follow on user interaction
           window.map.on("dragstart", () => {
             window.isFollowingUser = false;
@@ -195,9 +332,47 @@ export default function FullMapScreen({ route }) {
             let data;
             try { data = JSON.parse(event.data); } catch { return; }
 
+            console.log("[FullMap] Message received:", data.type);
+
+            if (data.type === "BUS_UPDATE") {
+              console.log("[FullMap] BUS_UPDATE received:", data.buses);
+              const buses = data.buses || [];
+
+              // Clear existing bus markers
+              if (window.busMarkers) {
+                Object.values(window.busMarkers).forEach(m => map.removeLayer(m));
+              }
+              window.busMarkers = {};
+
+              // Add new markers
+              buses.forEach(bus => {
+                if (!bus.trackingActive) return;
+
+                const lat = bus.lat ?? bus.latitude;
+                const lng = bus.lng ?? bus.longitude;
+                if (lat == null || lng == null) return;
+
+                const busIcon = L.divIcon({
+                  html: '<div style="font-size:28px;background:white;border-radius:50%;width:36px;height:36px;display:flex;align-items:center;justify-content:center;box-shadow:0 0 6px rgba(0,0,0,0.3);">🚌</div>',
+                  className: '',
+                  iconSize: [36, 36],
+                  iconAnchor: [18, 18]
+                });
+
+                window.busMarkers[bus.busId] = L.marker([lat, lng], { icon: busIcon })
+                  .addTo(map)
+                  .bindPopup("Bus: " + bus.busId);
+              });
+
+              console.log("[FullMap] Rendered buses:", buses.length);
+              return;
+            }
+
             if (data.type === "USER_LOCATION") {
-              const lat = Number(data.lat);
-              const lng = Number(data.lng);
+              // Standardized payload: { payload: { latitude, longitude } }
+              if (!data.payload || data.payload.latitude == null || data.payload.longitude == null) return;
+              const lat = Number(data.payload.latitude);
+              const lng = Number(data.payload.longitude);
               if (isNaN(lat) || isNaN(lng)) return;
 
               // Store for fallback
@@ -246,7 +421,7 @@ export default function FullMapScreen({ route }) {
             }
 
             if (data.type === "BUS_DATA") {
-              // Existing bus marker logic handled by markersScript
+              // Legacy - handled by BUS_UPDATE
             }
 
             if (data.type === "RECENTER") {
@@ -315,8 +490,6 @@ export default function FullMapScreen({ route }) {
           }
 
           ${markersScript}
-
-          window.ReactNativeWebView.postMessage(JSON.stringify({ type: "MAP_READY" }));
         </script>
       </body>
       </html>
@@ -324,21 +497,7 @@ export default function FullMapScreen({ route }) {
     [center.latitude, center.longitude, userLocation, markersScript]
   );
 
-  // Send user location to WebView
-  useEffect(() => {
-    if (!routeUserLocation || !webViewRef.current) return;
-
-    const lat = routeUserLocation?.lat ?? routeUserLocation?.latitude;
-    const lng = routeUserLocation?.lng ?? routeUserLocation?.longitude;
-    if (!lat || !lng) return;
-
-    webViewRef.current.postMessage(JSON.stringify({
-      type: "USER_LOCATION",
-      lat: lat,
-      lng: lng
-    }));
-  }, [routeUserLocation]);
-
+  // isRecentering state for recenter button
   const [isRecentering, setIsRecentering] = useState(false);
 
   const handleRecenter = () => {
@@ -357,6 +516,7 @@ export default function FullMapScreen({ route }) {
         javaScriptEnabled={true}
         domStorageEnabled={true}
         mixedContentMode="always"
+        onMessage={handleWebViewMessage}
         style={{ flex: 1 }}
       />
       <TouchableOpacity

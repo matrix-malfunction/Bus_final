@@ -32,6 +32,12 @@ global.bgToken = null;
 global.bgLastLocation = null; // { latitude, longitude, timestamp }
 // SOS freeze state - stops location updates when SOS is active
 global.bgSosActive = false;
+// Explicit tracking control - prevents hidden background tracking
+global.trackingActive = false;
+
+// Race-safety for SOS polling
+let isCheckingSOS = false;
+let lastRequestId = 0;
 
 // Constants for GPS filtering
 const DUPLICATE_THRESHOLD_METERS = 2; // Skip if moved less than 2m
@@ -57,6 +63,11 @@ const haversineMeters = (lat1, lng1, lat2, lng2) => {
 TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
   if (error) {
     console.log("[BG TASK] Error:", error.message);
+    return;
+  }
+  // GUARD: Only process if tracking explicitly enabled
+  if (!global.trackingActive) {
+    console.log("[BG TASK] Skipped - tracking not active");
     return;
   }
   if (data) {
@@ -320,6 +331,7 @@ export default function DriverTrackingScreen({ token }) {
         },
       });
 
+      global.trackingActive = true;
       console.log("[BG TRACKING] Started successfully");
       return true;
     } catch (err) {
@@ -338,6 +350,8 @@ export default function DriverTrackingScreen({ token }) {
       }
     } catch (err) {
       console.log("[BG TRACKING] Stop error:", err.message);
+    } finally {
+      global.trackingActive = false;
     }
   };
 
@@ -385,6 +399,12 @@ export default function DriverTrackingScreen({ token }) {
 
   // Send location to backend with retry queue and network awareness
   const sendLocationToBackend = async (location, attempt = 1, isFromQueue = false) => {
+    // GUARD: Only send if tracking explicitly enabled
+    if (!global.trackingActive) {
+      console.log("[API] BLOCKED - tracking not active");
+      return;
+    }
+
     const { latitude, longitude, accuracy, altitude, heading, speed } = location;
 
     // STRICT THROTTLE: Check API rate limiting (5 seconds)
@@ -684,9 +704,9 @@ export default function DriverTrackingScreen({ token }) {
 
         // Check if background tracking is running
         const isRunning = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
-        if (!isRunning) {
-          console.log("[APP START] Background tracking not running - starting now");
-          await startBackgroundTracking();
+        if (isRunning && !global.trackingActive) {
+          console.log("[APP START] Stopping orphaned background tracking");
+          await stopBackgroundTracking();
         } else {
           console.log("[APP START] Background tracking already running");
         }
@@ -724,18 +744,69 @@ export default function DriverTrackingScreen({ token }) {
     const interval = setInterval(async () => {
       if (!busId || !global.bgSosActive) return;
 
-      try {
-        const res = await fetch(`${API_BASE_URL}/api/sos/status?busId=${busId}`);
-        const data = await res.json();
+      // Prevent overlapping requests
+      if (isCheckingSOS) return;
+      isCheckingSOS = true;
 
+      // Track request for staleness check
+      const requestId = ++lastRequestId;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+
+      try {
+        const res = await fetch(
+          `${API_BASE_URL}/api/sos/status?busId=${encodeURIComponent(busId)}&t=${Date.now()}`,
+          {
+            signal: controller.signal,
+            headers: {
+              "Cache-Control": "no-cache"
+            }
+          }
+        );
+
+        // Status guard
+        if (!res.ok) {
+          console.warn("[SOS CHECK] Request failed:", res.status);
+          return;
+        }
+
+        // Safe parse
+        const text = await res.text();
+
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          console.warn("[SOS CHECK] Non-JSON response, skipping");
+          return;
+        }
+
+        // Ignore stale responses
+        if (requestId !== lastRequestId) {
+          console.log("[SOS CHECK] Stale response ignored");
+          return;
+        }
+
+        // Use single truth
+        if (data.active) {
+          console.log("[SOS CHECK] Active SOS detected");
+        } else {
+          console.log("[SOS CHECK] No active SOS");
+        }
+
+        // Use normalized schema ONLY
         if (!data.active && global.bgSosActive) {
           console.log("[SOS STATE] Backend cleared - resuming tracking");
-
           global.bgSosActive = false;
           sosActiveRef.current = false;
         }
-      } catch (e) {
-        console.log("[SOS CHECK ERROR]", e.message);
+      } catch (err) {
+        console.warn("[SOS CHECK] Request timeout or failed");
+      } finally {
+        clearTimeout(timeout);
+        // GUARANTEED reset (only place allowed)
+        isCheckingSOS = false;
       }
     }, 5000);
 
