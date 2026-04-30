@@ -43,269 +43,411 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     html, body, #map { height: 100%; margin: 0; }
+
+    /* Beacon pulse animation - Google Maps style */
+    .beacon-container { position: relative; }
+    .beacon-dot {
+      width: 12px;
+      height: 12px;
+      background: #007AFF;
+      border-radius: 50%;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 2;
+    }
+    .beacon-pulse {
+      width: 40px;
+      height: 40px;
+      background: rgba(0,122,255,0.3);
+      border-radius: 50%;
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      animation: pulse-ring 1.5s ease-out infinite;
+      z-index: 1;
+    }
+    @keyframes pulse-ring {
+      0% { transform: translate(-50%, -50%) scale(0.5); opacity: 1; }
+      100% { transform: translate(-50%, -50%) scale(1.5); opacity: 0; }
+    }
+
+    /* Modern Popup Styles */
+    .bus-popup { padding: 12px; min-width: 160px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .bus-popup-header { font-weight: 600; font-size: 14px; margin-bottom: 8px; color: #333; }
+    .bus-popup-row { font-size: 12px; color: #666; margin: 4px 0; }
+
+    /* Toggle Switch */
+    .follow-toggle { display: flex; align-items: center; margin-top: 8px; cursor: pointer; }
+    .follow-toggle input { display: none; }
+    .toggle-slider {
+      width: 40px; height: 20px; background: #ccc; border-radius: 10px;
+      position: relative; transition: 0.3s; margin-right: 8px;
+    }
+    .toggle-slider::after {
+      content: ''; position: absolute; width: 16px; height: 16px;
+      background: white; border-radius: 50%; top: 2px; left: 2px;
+      transition: 0.3s;
+    }
+    .follow-toggle input:checked + .toggle-slider { background: #007AFF; }
+    .follow-toggle input:checked + .toggle-slider::after { left: 22px; }
+    .toggle-label { font-size: 12px; color: #333; }
   </style>
 </head>
 <body>
-  <div id="map"></div>
+  <div id="map" style="height:100vh;"></div>
   <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // Initialize map - MAP_READY sent only when map is fully ready
-    var map = L.map('map').setView([13.0827, 80.2707], 13);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19
-    }).addTo(map);
+    // Wrap ALL logic inside DOMContentLoaded to ensure Leaflet + DOM are ready
+    document.addEventListener("DOMContentLoaded", function() {
+      console.log("[WEBVIEW] DOMContentLoaded - Initializing map...");
 
-    // Hardened MAP_READY delivery - multiple safeguards
-    window.__MAP_READY_SENT__ = false;
-    
-    function sendMapReady() {
-      if (window.__MAP_READY_SENT__) return; // Idempotent
-      if (!window.ReactNativeWebView) {
-        console.log("[WEBVIEW] ReactNativeWebView not available");
-        return;
+      // 1. CREATE MAP FIRST (zoomControl disabled, use RN buttons only)
+      var map = L.map('map', { zoomControl: false }).setView([13.0827, 80.2707], 13);
+      window.map = map; // Expose globally
+
+      // 2. ADD TILE LAYER
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19
+      }).addTo(map);
+
+      // 3. CREATE GLOBALS AFTER MAP EXISTS
+      window.__MAP_READY__ = false;
+      window.__MAP_READY_SENT__ = false;
+      window.__BUS_LISTENER_ATTACHED__ = false;
+      window.busMarkers = {};
+      window.userMarker = null;
+      window.userPulse = null;
+      window.followBusId = null;
+      window.userLocation = null;
+      window._lastFollow = 0;
+      window.__pulseRadius = 0;
+      window.__pulseInterval = null;
+
+      // 4. MAP READY HANDLER
+      function sendMapReady() {
+        if (window.__MAP_READY_SENT__) return;
+        if (!window.ReactNativeWebView) {
+          console.log("[WEBVIEW] ReactNativeWebView not available");
+          return;
+        }
+        window.ReactNativeWebView.postMessage(
+          JSON.stringify({ type: "MAP_READY" })
+        );
+        window.__MAP_READY_SENT__ = true;
+        console.log("[WEBVIEW] MAP_READY sent");
       }
-      
-      window.ReactNativeWebView.postMessage(
-        JSON.stringify({ type: "MAP_READY" })
-      );
-      window.__MAP_READY_SENT__ = true;
-      console.log("[WEBVIEW] MAP_READY sent (idempotent)");
-    }
-    
-    // Primary: Send when map is ready
-    map.whenReady(function() {
-      sendMapReady();
-    });
-    
-    // Fallback 1: 1 second timeout in case whenReady fails
-    setTimeout(function() {
-      if (!window.__MAP_READY_SENT__) {
-        console.log("[WEBVIEW] Fallback timeout triggered");
+
+      // 5. WHEN MAP IS ACTUALLY READY
+      map.whenReady(function() {
+        window.__MAP_READY__ = true;
+        console.log("[WEBVIEW] Map is ready");
         sendMapReady();
-      }
-    }, 1000);
-    
-    // Fallback 2: DOM ready as last resort
-    if (document.readyState === "complete") {
-      sendMapReady();
-    } else {
-      document.addEventListener("DOMContentLoaded", function() {
+      });
+
+      // 6. FALLBACK TIMEOUT
+      setTimeout(function() {
         if (!window.__MAP_READY_SENT__) {
-          console.log("[WEBVIEW] DOMContentLoaded fallback");
+          console.log("[WEBVIEW] Fallback timeout - forcing MAP_READY");
+          window.__MAP_READY__ = true;
           sendMapReady();
         }
-      });
-    }
+      }, 1500);
 
-    // Marker storage
-    window.busMarkers = {};
-    window.userMarker = null; // Single user marker - no duplicates
+      // 7. MESSAGE HANDLER
+      function handleMessage(event) {
+        try {
+          if (!event || !event.data) return;
 
-    // Unified message handler - works with both document and window events
-    function handleMessage(event) {
-      try {
-        // Log RAW data first
-        console.log("[WEBVIEW] RAW:", event.data);
-        
-        if (!event || !event.data) {
-          console.log("[WEBVIEW] Empty message, skipping");
-          return;
-        }
+          var data;
+          try {
+            data = JSON.parse(event.data);
+          } catch (e) {
+            console.log("[WEBVIEW] JSON parse error:", e.message);
+            return;
+          }
 
-        var data = JSON.parse(event.data);
-        console.log("[WEBVIEW] TYPE:", data ? data.type : "null");
-        if (!data || !data.type) {
-          console.log("[WEBVIEW] Invalid message format");
-          return;
-        }
+          console.log("[WEBVIEW] Received:", data.type);
 
-        switch (data.type) {
-          case "TEST":
-            console.log("[WEBVIEW] TEST message received - bridge is working!");
-            break;
-          case "USER_LOCATION":
-            // Support both: flat structure and payload structure (backward compatible)
-            const lat = data.latitude ?? data.payload?.latitude;
-            const lng = data.longitude ?? data.payload?.longitude;
-            
-            if (lat != null && lng != null) {
-              handleUserLocation(Number(lat), Number(lng));
-            } else {
-              console.log("[WEBVIEW] Invalid USER_LOCATION - missing lat/lng:", data);
-            }
-            break;
-
-          case "BUS_OFFLINE":
-            // Instant marker removal for offline buses
-            if (data.busId) {
-              console.log("[WEBVIEW] Bus offline: " + data.busId);
-              var marker = window.busMarkers[data.busId];
-              if (marker && map && map.removeLayer) {
-                map.removeLayer(marker);
-                delete window.busMarkers[data.busId];
+          switch (data.type) {
+            case "USER_LOCATION":
+              if (!window.map) return;
+              console.log("[WEBVIEW] USER_LOCATION received:", data.payload);
+              const lat = data.payload?.lat;
+              const lng = data.payload?.lng;
+              if (lat != null && lng != null) {
+                setUserLocation(Number(lat), Number(lng));
               }
-            }
-            break;
+              break;
 
-          case "BUS_UPDATE":
-            // Strict payload contract validation
-            if (!Array.isArray(data.buses)) {
-              console.log("[WEBVIEW] Invalid BUS_UPDATE payload");
-              return;
-            }
-            console.log("[WEBVIEW] buses: " + data.buses.length);
-            if (data.buses.length === 0) {
-              console.log("[WEBVIEW] No active buses");
-            }
-            updateBuses(data.buses);
-            break;
+            case "FOLLOW_UPDATE":
+              window.__followBusId = data.busId || null;
+              console.log("[WEBVIEW] FOLLOW_UPDATE:", window.__followBusId);
+              break;
 
-          default:
-            console.log("[WEBVIEW] Unknown message type: " + data.type);
-        }
-      } catch (e) {
-        console.log("[WEBVIEW] Invalid message: " + e.message);
-      }
-    }
+            case "ZOOM_IN":
+              if (window.map) window.map.zoomIn();
+              break;
 
-    // Handle user location - single marker, center map, no duplicates
-    function handleUserLocation(lat, lng) {
-      console.log("[WEBVIEW] handleUserLocation called:", lat, lng);
-      if (typeof lat !== "number" || typeof lng !== "number") {
-        console.log("[WEBVIEW] Invalid user location types:", typeof lat, typeof lng);
-        return;
-      }
+            case "ZOOM_OUT":
+              if (window.map) window.map.zoomOut();
+              break;
 
-      // Center map on user location
-      map.setView([lat, lng], 14);
-      console.log("[WEBVIEW] Map centered on user location");
+            case "RECENTER":
+              if (window.map && window.userMarker) {
+                const pos = window.userMarker.getLatLng();
+                window.map.flyTo(pos, 15, { duration: 0.5 });
+              }
+              break;
 
-      // Create or update single user marker
-      if (window.userMarker) {
-        window.userMarker.setLatLng([lat, lng]);
-        console.log("[WEBVIEW] User marker updated");
-      } else {
-        // Custom icon for user location (blue circle)
-        var userIcon = L.divIcon({
-          className: "user-location-marker",
-          html: '<div style="width: 16px; height: 16px; background: #0066ff; border: 3px solid white; border-radius: 50%; box-shadow: 0 2px 6px rgba(0,0,0,0.3);"></div>',
-          iconSize: [16, 16],
-          iconAnchor: [8, 8]
-        });
-        window.userMarker = L.marker([lat, lng], { icon: userIcon, zIndexOffset: 1000 }).addTo(map);
-        console.log("[WEBVIEW] User marker created");
-      }
+            case "BUS_OFFLINE":
+              if (data.busId && window.busMarkers[data.busId]) {
+                if (window.map && window.map.removeLayer) {
+                  window.map.removeLayer(window.busMarkers[data.busId]);
+                }
+                delete window.busMarkers[data.busId];
+                if (window.followBusId === data.busId) {
+                  window.followBusId = null;
+                  if (window.userLocation && window.map && window.map.panTo) {
+                    window.map.panTo([window.userLocation.lat, window.userLocation.lng], { animate: true });
+                  }
+                }
+              }
+              break;
 
-      // Center map on user location (smooth pan)
-      map.panTo([lat, lng], { animate: true, duration: 0.5 });
+            case "BUS_LOCATION_UPDATE":
+              if (!data || !data.busId) return;
+              updateBusMarker(data);
+              break;
 
-      console.log("[WEBVIEW] User location updated: " + lat + ", " + lng);
-    }
+            case "BUS_UPDATE":
+              if (!Array.isArray(data.buses)) {
+                console.log("[WEBVIEW] Invalid BUS_UPDATE");
+                return;
+              }
 
-    // Prevent duplicate listeners on WebView reload
-    // Attach BOTH document and window listeners for cross-platform compatibility
-    if (!window.__BUS_LISTENER_ATTACHED__) {
-      window.__BUS_LISTENER_ATTACHED__ = true;
-      document.addEventListener("message", handleMessage);
-      window.addEventListener("message", handleMessage);
-      console.log("[WEBVIEW] Message listeners attached (document + window)");
-    }
+              // Process buses
+              data.buses.forEach(function(bus) {
+                if (!bus || !bus._id) return;
+                var busLat = bus.lat ?? bus.latitude;
+                var busLng = bus.lng ?? bus.longitude;
+                if (typeof busLat !== "number" || typeof busLng !== "number") return;
 
-    // Marker system with strict validation and timestamp ordering
-    function updateBuses(buses) {
-      if (!window.busMarkers) window.busMarkers = {};
+                var marker = window.busMarkers[bus._id];
+                if (marker) {
+                  marker.setLatLng([busLat, busLng]);
+                  if (bus.lastUpdate) marker._ts = bus.lastUpdate;
+                } else {
+                  var busIcon = L.divIcon({
+                    className: "bus-marker",
+                    html: '<div style="font-size:24px;">🚌</div>',
+                    iconSize: [30, 30],
+                    iconAnchor: [15, 15]
+                  });
+                  var newMarker = L.marker([busLat, busLng], { icon: busIcon }).addTo(window.map);
+                  if (bus.lastUpdate) newMarker._ts = bus.lastUpdate;
+                  window.busMarkers[bus._id] = newMarker;
+                }
+              });
 
-      // Validate array input
-      if (!Array.isArray(buses)) {
-        console.log("[WEBVIEW] Invalid buses data");
-        return;
-      }
+              // Cleanup stale markers (not in current update)
+              var currentIds = {};
+              data.buses.forEach(function(b) { if (b && b._id) currentIds[b._id] = true; });
+              Object.keys(window.busMarkers).forEach(function(id) {
+                if (!currentIds[id]) {
+                  if (window.map && window.map.removeLayer) {
+                    window.map.removeLayer(window.busMarkers[id]);
+                  }
+                  delete window.busMarkers[id];
+                }
+              });
 
-      var existingIds = {};
-      var keys = Object.keys(window.busMarkers);
+              console.log("[WEBVIEW] Active buses:", Object.keys(window.busMarkers).length);
+              break;
 
-      for (var i = 0; i < keys.length; i++) {
-        existingIds[keys[i]] = true;
-      }
-
-      var processedCount = 0;
-      for (var i = 0; i < buses.length; i++) {
-        var bus = buses[i];
-
-        // Strict ID consistency - use bus._id only
-        if (!bus || !bus._id || typeof bus._id !== "string") continue;
-        
-        // Support both lat/lng and latitude/longitude property names
-        var busLat = bus.lat ?? bus.latitude;
-        var busLng = bus.lng ?? bus.longitude;
-        if (typeof busLat !== "number" || typeof busLng !== "number") continue;
-        
-        processedCount++;
-
-        var id = bus._id;
-        var marker = window.busMarkers[id];
-
-        // Warning for missing lastUpdate
-        if (!bus.lastUpdate) {
-          console.log("[WEBVIEW] Warning: missing lastUpdate for " + id);
-        }
-
-        // Check timestamp ordering - ignore stale updates (backend-driven only)
-        if (marker && marker._ts && bus.lastUpdate) {
-          if (marker._ts > bus.lastUpdate) {
-            console.log("[WEBVIEW] Stale update ignored for " + id);
-            continue;
+            default:
+              console.log("[WEBVIEW] Unknown type:", data.type);
           }
+        } catch (e) {
+          console.log("[WEBVIEW] Handler error:", e.message);
         }
+      }
 
-        // Update existing marker (no duplicates)
-        if (marker) {
-          marker.setLatLng([busLat, busLng]);
-          if (bus.lastUpdate) marker._ts = bus.lastUpdate;
+      // 8. ATTACH LISTENERS
+      if (!window.__BUS_LISTENER_ATTACHED__) {
+        window.__BUS_LISTENER_ATTACHED__ = true;
+        document.addEventListener("message", handleMessage);
+        window.addEventListener("message", handleMessage);
+        console.log("[WEBVIEW] Listeners attached");
+      }
+
+      // UNIFIED SET USER LOCATION (with CSS pulse - zoom independent)
+      function setUserLocation(lat, lng) {
+        if (!window.map) return;
+
+        const pos = [lat, lng];
+        window.userLocation = { lat, lng };
+
+        // Marker (create once)
+        if (!window.userMarker) {
+          window.userMarker = L.circleMarker(pos, {
+            radius: 6,
+            color: "#007AFF",
+            fillColor: "#007AFF",
+            fillOpacity: 1,
+          }).addTo(window.map);
+
+          window.userMarker.bindPopup("📍 I am here");
         } else {
-          // Create new marker with bus icon
-          var busIcon = L.divIcon({
-            className: "bus-marker",
-            html: '<div style="font-size:24px;">🚌</div>',
-            iconSize: [30, 30],
-            iconAnchor: [15, 15]
+          window.userMarker.setLatLng(pos);
+        }
+
+        // CSS Pulse marker (create once) - zoom independent divIcon
+        if (!window.userPulse) {
+          const pulseIcon = L.divIcon({
+            className: 'beacon-container',
+            html: '<div class="beacon-dot"></div><div class="beacon-pulse"></div>',
+            iconSize: [20, 20],
+            iconAnchor: [10, 10]
           });
-          var newMarker = L.marker([busLat, busLng], { icon: busIcon }).addTo(map);
-          if (bus.lastUpdate) newMarker._ts = bus.lastUpdate;
-          window.busMarkers[id] = newMarker;
-        }
-
-        delete existingIds[id];
-      }
-
-      // Remove markers not in payload (ghost marker prevention)
-      for (var id in existingIds) {
-        if (existingIds.hasOwnProperty(id)) {
-          var markerToRemove = window.busMarkers[id];
-
-          // Crash-safe removal
-          if (markerToRemove && map && map.removeLayer) {
-            map.removeLayer(markerToRemove);
-          }
-
-          delete window.busMarkers[id];
+          window.userPulse = L.marker(pos, { icon: pulseIcon, zIndexOffset: -100 }).addTo(window.map);
+        } else {
+          window.userPulse.setLatLng(pos);
         }
       }
-      
-      console.log("[WEBVIEW] Processed " + processedCount + " buses, " + Object.keys(window.busMarkers).length + " markers total");
-    }
 
-    // Handle BUS_OFFLINE - instant marker removal
-    function handleBusOffline(busId) {
-      if (!window.busMarkers || !busId) return;
-
-      var marker = window.busMarkers[busId];
-      if (marker && map && map.removeLayer) {
-        map.removeLayer(marker);
-        delete window.busMarkers[busId];
-        console.log("[WEBVIEW] Bus offline removed: " + busId);
+      // SINGLE POPUP GENERATOR with toggle switch
+      function getBusPopup(bus) {
+        const isFollowing = window.__followBusId === bus.id;
+        const speed = Math.round(bus.speed || 0);
+        const eta = bus.eta ?? "--";
+        return \`
+          <div class="bus-popup">
+            <div class="bus-popup-header">\${bus.name || "Bus"}</div>
+            <div class="bus-popup-row">Speed: \${speed} km/h</div>
+            <div class="bus-popup-row">ETA: \${eta} min</div>
+            <label class="follow-toggle">
+              <input type="checkbox" \${isFollowing ? 'checked' : ''} onchange="toggleFollow('\${bus.id}')">
+              <span class="toggle-slider"></span>
+              <span class="toggle-label">\${isFollowing ? 'Following' : 'Follow'}</span>
+            </label>
+          </div>
+        \`;
       }
-    }
+
+      // TOGGLE FOLLOW with optimistic UI update
+      window.toggleFollow = function(busId) {
+        // Optimistic update: toggle immediately
+        const wasFollowing = window.__followBusId === busId;
+        window.__followBusId = wasFollowing ? null : busId;
+
+        // Update popup content immediately if open
+        const marker = window.busMarkers[busId];
+        if (marker && marker.getPopup()?.isOpen() && marker.__busData) {
+          marker.setPopupContent(getBusPopup(marker.__busData));
+        }
+
+        // Send to React Native
+        window.ReactNativeWebView.postMessage(
+          JSON.stringify({
+            type: "TOGGLE_FOLLOW",
+            busId,
+          })
+        );
+      };
+
+      // RECENTER FUNCTION
+      function recenterToUser() {
+        if (!window.map || !window.userMarker) return;
+        const pos = window.userMarker.getLatLng();
+        window.map.flyTo(pos, 15, { duration: 0.5 });
+      }
+
+      // DRAG DETECTION
+      window.map.on("dragstart", () => {
+        window.__userDragging = true;
+
+        window.ReactNativeWebView.postMessage(
+          JSON.stringify({ type: "FOLLOW_STOPPED" })
+        );
+      });
+
+      // UPDATE BUS MARKER (no recreation)
+      window.__followBusId = null;
+      window.__userDragging = false;
+      window.__lastFlyTo = 0;
+
+      function updateBusMarker(data) {
+        if (!window.map || !data.busId) return;
+
+        const busId = data.busId;
+        const lat = data.latitude ?? data.lat;
+        const lng = data.longitude ?? data.lng;
+        const speed = data.speed ?? 0;
+
+        if (typeof lat !== "number" || typeof lng !== "number") return;
+
+        const busData = {
+          id: busId,
+          name: data.name || busId,
+          speed: speed,
+          eta: data.eta,
+        };
+
+        if (!window.busMarkers[busId]) {
+          // CREATE NEW MARKER
+          const marker = L.marker([lat, lng]).addTo(window.map);
+
+          marker.bindPopup(getBusPopup(busData));
+          window.busMarkers[busId] = marker;
+        }
+
+        // Store full bus data on marker for optimistic updates
+        const marker = window.busMarkers[busId];
+        marker.__busData = busData;
+
+        // Update position
+        marker.setLatLng([lat, lng]);
+
+        // Update popup content safely (only if open)
+        if (marker.getPopup()?.isOpen()) {
+          marker.setPopupContent(getBusPopup(busData));
+        }
+
+        // CAMERA FOLLOW (throttled)
+        if (
+          window.__followBusId === busId &&
+          !window.__userDragging &&
+          Date.now() - window.__lastFlyTo > 500
+        ) {
+          window.__lastFlyTo = Date.now();
+
+          window.map.flyTo([lat, lng], window.map.getZoom(), {
+            duration: 0.5,
+          });
+        }
+      }
+
+      // BUS_UPDATE handler (batch update)
+      window.__busUpdatePending = null;
+      function handleBusUpdate(buses) {
+        if (!Array.isArray(buses)) return;
+        buses.forEach(function(bus) {
+          if (!bus || !bus._id) return;
+          updateBusMarker({
+            busId: bus._id,
+            latitude: bus.lat ?? bus.latitude,
+            longitude: bus.lng ?? bus.longitude,
+            speed: bus.speed ?? 0,
+            name: bus.name,
+          });
+        });
+      }
+
+      console.log("[WEBVIEW] Initialization complete, waiting for map...");
+    });
   </script>
 </body>
 </html>
@@ -333,27 +475,21 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
         if (lastUserLocationRef.current && webViewRef.current) {
           webViewRef.current.postMessage(JSON.stringify({
             type: "USER_LOCATION",
-            latitude: lastUserLocationRef.current.latitude,
-            longitude: lastUserLocationRef.current.longitude
+            payload: {
+              lat: lastUserLocationRef.current.lat,
+              lng: lastUserLocationRef.current.lng
+            }
           }));
           console.log("[RN] USER_LOCATION resent on MAP_READY");
         }
 
-        // ALSO send BUS_UPDATE on MAP_READY
-        if (buses && webViewRef.current) {
-          const busesArray = buses && typeof buses === 'object' && !Array.isArray(buses) 
-            ? Object.values(buses) 
-            : (buses || []);
-          const activeBuses = busesArray.filter(bus =>
-            bus && bus._id && bus.trackingActive === true &&
-            typeof bus.lat === "number" && typeof bus.lng === "number"
-          );
-          
+        // ALSO resend FOLLOW_UPDATE on MAP_READY
+        if (webViewRef.current) {
           webViewRef.current.postMessage(JSON.stringify({
-            type: "BUS_UPDATE",
-            buses: activeBuses
+            type: "FOLLOW_UPDATE",
+            busId: followBusId
           }));
-          console.log("[RN] BUS_UPDATE sent on MAP_READY - count:", activeBuses.length);
+          console.log("[RN] FOLLOW_UPDATE resent on MAP_READY");
         }
       }
       
@@ -362,26 +498,64 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
         console.log("[RN] PING received, responding with PONG");
         webViewRef.current?.postMessage(JSON.stringify({ type: "PONG" }));
       }
+
+      // FOLLOW_STOPPED from WebView (user dragged map)
+      if (data.type === "FOLLOW_STOPPED") {
+        console.log("[RN] FOLLOW_STOPPED from MiniMap WebView");
+        setFollowBusId(null);
+        return;
+      }
+
+      // TOGGLE_FOLLOW from WebView (popup button clicked)
+      if (data.type === "TOGGLE_FOLLOW") {
+        console.log("[RN] TOGGLE_FOLLOW from MiniMap:", data.busId);
+        setFollowBusId(prev => prev === data.busId ? null : data.busId);
+        return;
+      }
     } catch (e) {
       console.log("[MiniMap] Invalid message:", event?.nativeEvent?.data, e.message);
     }
   };
 
   return (
-    <TouchableOpacity onPress={onPress} activeOpacity={0.9}>
-      <View style={styles.mapContainer}>
-        <WebView
-          ref={webViewRef}
-          source={{ html: mapHTML }}
-          onMessage={handleWebViewMessage}
-          javaScriptEnabled={true}
-          domStorageEnabled={true}
-          originWhitelist={["*"]}
-          scrollEnabled={false}
-          style={{ width: '100%', height: 200 }}
-        />
+    <View style={styles.mapContainer}>
+      <WebView
+        ref={webViewRef}
+        source={{ html: mapHTML }}
+        onMessage={handleWebViewMessage}
+        javaScriptEnabled={true}
+        domStorageEnabled={true}
+        originWhitelist={["*"]}
+        scrollEnabled={false}
+        style={{ width: '100%', height: 200 }}
+      />
+      {/* Zoom Controls */}
+      <View style={styles.zoomControls}>
+        <TouchableOpacity
+          style={styles.zoomButton}
+          onPress={() => webViewRef.current?.postMessage(JSON.stringify({ type: "ZOOM_IN" }))}
+        >
+          <Text style={styles.zoomText}>+</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.zoomButton}
+          onPress={() => webViewRef.current?.postMessage(JSON.stringify({ type: "ZOOM_OUT" }))}
+        >
+          <Text style={styles.zoomText}>−</Text>
+        </TouchableOpacity>
       </View>
-    </TouchableOpacity>
+      {/* Recenter Button */}
+      <TouchableOpacity
+        style={[styles.zoomButton, { position: 'absolute', bottom: 10, left: 10, backgroundColor: '#007AFF' }]}
+        onPress={() => webViewRef.current?.postMessage(JSON.stringify({ type: "RECENTER" }))}
+      >
+        <Text style={{ color: 'white', fontSize: 18 }}>⌖</Text>
+      </TouchableOpacity>
+      {/* Full Map Button */}
+      <TouchableOpacity style={styles.fullMapButton} onPress={onPress}>
+        <Text style={styles.fullMapText}>Full Map</Text>
+      </TouchableOpacity>
+    </View>
   );
 };
 
@@ -390,6 +564,9 @@ const HomeScreen = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [userLocation, setUserLocation] = useState(DEFAULT_CENTER);
   const { buses, socket } = useBus();
+  
+  // Local follow state (single source of truth for this screen)
+  const [followBusId, setFollowBusId] = useState(null);
   const [sosAlerts, setSosAlerts] = useState([]);
   const webViewRef = useRef(null);
   const retryTimeoutRef = useRef(null);
@@ -400,6 +577,44 @@ const HomeScreen = () => {
 
   // Track alerted SOS buses to prevent duplicate alerts
   const alertedSOS = useRef(new Set());
+
+  // Send USER_LOCATION to MiniMap WebView when location changes
+  useEffect(() => {
+    if (!userLocation) return;
+
+    // Cache in ref for resend on WebView load
+    lastUserLocationRef.current = {
+      lat: userLocation.latitude,
+      lng: userLocation.longitude,
+    };
+
+    // Send to MiniMap WebView
+    const msg = {
+      type: "USER_LOCATION",
+      payload: {
+        lat: userLocation.latitude,
+        lng: userLocation.longitude
+      }
+    };
+
+    if (webViewRef.current) {
+      webViewRef.current.postMessage(JSON.stringify(msg));
+      console.log("[RN] Sent USER_LOCATION to MiniMap:", userLocation.latitude, userLocation.longitude);
+    }
+  }, [userLocation, webViewReady]);
+
+  // Send FOLLOW_UPDATE to MiniMap WebView when followBusId changes
+  useEffect(() => {
+    const msg = {
+      type: "FOLLOW_UPDATE",
+      busId: followBusId,
+    };
+
+    if (webViewRef.current) {
+      webViewRef.current.postMessage(JSON.stringify(msg));
+      console.log("[RN] Sent FOLLOW_UPDATE to MiniMap:", followBusId);
+    }
+  }, [followBusId, webViewReady]);
 
   // Send BUS_UPDATE to WebView when buses change and WebView is ready
   useEffect(() => {
@@ -527,30 +742,6 @@ const HomeScreen = () => {
     })();
   }, []);
 
-  // Send USER_LOCATION to MiniMap WebView when location changes
-  // Standardized schema: { type: "USER_LOCATION", payload: { latitude, longitude } }
-  useEffect(() => {
-    if (!userLocation) return;
-
-    // Cache in ref for resend on WebView load (no state used)
-    lastUserLocationRef.current = {
-      latitude: userLocation.latitude,
-      longitude: userLocation.longitude,
-    };
-
-    // Send immediately if WebView ref exists (webViewReady bypassed for testing)
-    if (webViewRef.current) {
-      webViewRef.current.postMessage(JSON.stringify({
-        type: "USER_LOCATION",
-        latitude: lastUserLocationRef.current.latitude,
-        longitude: lastUserLocationRef.current.longitude
-      }));
-      console.log("[RN] Sent USER_LOCATION to MiniMap (webViewReady:", webViewReady, ")");
-    } else {
-      console.log("[RN] USER_LOCATION deferred - no WebView ref");
-    }
-  }, [userLocation, webViewReady]);
-
   // Safe sender to WebView with deduplicated queue
   const sendToWebView = useCallback((msg) => {
     if (!webViewRef.current || !webViewReady) {
@@ -562,16 +753,6 @@ const HomeScreen = () => {
     }
     webViewRef.current.postMessage(JSON.stringify(msg));
   }, [webViewReady]);
-
-  // Test button handler - sends TEST message to WebView
-  const sendTestMessage = useCallback(() => {
-    if (webViewRef.current) {
-      webViewRef.current.postMessage(JSON.stringify({ type: "TEST" }));
-      console.log("[RN] TEST message sent to WebView");
-    } else {
-      console.log("[RN] Cannot send TEST - no WebView ref");
-    }
-  }, []);
 
   // Flush queued messages when WebView becomes ready
   useEffect(() => {
@@ -661,13 +842,6 @@ const HomeScreen = () => {
             buses={filteredBuses}
             userLocation={userLocation}
           />
-          {/* TEST Button for WebView bridge verification */}
-          <TouchableOpacity 
-            style={styles.testButton}
-            onPress={sendTestMessage}
-          >
-            <Text style={styles.testButtonText}>TEST WebView Bridge</Text>
-          </TouchableOpacity>
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -778,20 +952,58 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
 
-  testButton: {
+  mapContainer: {
+    height: 200,
     marginHorizontal: 16,
-    marginTop: 8,
-    backgroundColor: "#0066ff",
-    padding: 12,
-    borderRadius: 8,
-    alignItems: "center",
+    borderRadius: 12,
+    overflow: "hidden",
+    position: "relative",
   },
 
-  testButtonText: {
-    color: "#fff",
-    fontWeight: "bold",
-    fontSize: 14,
+  zoomControls: {
+    position: "absolute",
+    right: 8,
+    top: 8,
+    flexDirection: "column",
+    gap: 4,
   },
+
+  zoomButton: {
+    width: 32,
+    height: 32,
+    backgroundColor: "white",
+    borderRadius: 6,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
+    elevation: 3,
+  },
+
+  zoomText: {
+    fontSize: 20,
+    fontWeight: "bold",
+    color: "#333",
+  },
+
+  fullMapButton: {
+    position: "absolute",
+    bottom: 8,
+    right: 8,
+    backgroundColor: "rgba(0,0,0,0.7)",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+
+  fullMapText: {
+    color: "#fff",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+
 });
 
 export default HomeScreen;

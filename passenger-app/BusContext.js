@@ -7,7 +7,9 @@ export const BusContext = createContext({
   buses: {},
   sosAlerts: [],
   userLocation: null,
-  socket: null
+  socket: null,
+  followBusId: null,
+  setFollowBusId: () => {}
 });
 
 export const useBus = () => useContext(BusContext);
@@ -17,6 +19,8 @@ export function BusProvider({ children }) {
   const [buses, setBuses] = useState({});
   const [sosAlerts, setSosAlerts] = useState([]);
   const [socket, setSocket] = useState(null);
+  const [followBusId, setFollowBusId] = useState(null);
+  const [userLocation, setUserLocation] = useState(null);
 
   useEffect(() => {
     const newSocket = io(API_BASE_URL);
@@ -31,26 +35,35 @@ export function BusProvider({ children }) {
         return;
       }
       
-      setBuses((prevBuses) => ({
-        ...prevBuses,
-        [data.busId]: {
+      setBuses((prevBuses) => {
+        // Clean replacement - no merging of nested stale fields
+        const busData = {
           _id: data.busId,
           busId: data.busId,
           lat: data.latitude,
           lng: data.longitude,
-          trackingActive: true,
+          trackingActive: data.trackingActive !== false,
           lastUpdate: Date.now()
-        }
-      }));
+        };
+        const newBuses = { ...prevBuses };
+        newBuses[data.busId] = busData;  // Direct assignment, no merge
+        console.log("[FLOW] Buses updated:", Object.keys(newBuses));
+        return newBuses;
+      });
     });
 
-    newSocket.on("BUS_OFFLINE", (busId) => {
+    newSocket.on("BUS_OFFLINE", (data) => {
+      const busId = typeof data === 'string' ? data : data?.busId;
       console.log("[BusContext] BUS_OFFLINE received:", busId);
+      if (!busId) return;
       setBuses((prevBuses) => {
         const updated = { ...prevBuses };
         delete updated[busId];
+        console.log("[FLOW] Bus removed:", busId, "Remaining:", Object.keys(updated));
         return updated;
       });
+      // Reset follow if this bus was followed
+      setFollowBusId(prev => (prev === busId ? null : prev));
     });
 
     return () => {
@@ -62,7 +75,11 @@ export function BusProvider({ children }) {
     buses,
     sosAlerts,
     socket,
-    setSosAlerts
+    setSosAlerts,
+    followBusId,
+    setFollowBusId,
+    userLocation,
+    setUserLocation
   };
 
   return <BusContext.Provider value={value}>{children}</BusContext.Provider>;

@@ -570,6 +570,64 @@ export default function DriverTrackingScreen({ token }) {
     setStatus("Tracking • Online (queue flushed)");
   };
 
+  // Socket for real-time location updates
+  const socketRef = useRef(null);
+
+  // Initialize socket connection
+  useEffect(() => {
+    const socket = io(API_BASE_URL);
+    socketRef.current = socket;
+    return () => socket.disconnect();
+  }, []);
+
+  // Call backend to start tracking
+  const callBackendStartTracking = async (latitude, longitude) => {
+    try {
+      const headers = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      
+      const response = await fetch(`${API_BASE_URL}/api/location/start`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ 
+          busId, 
+          lat: latitude, 
+          lng: longitude 
+        }),
+      });
+      
+      if (response.ok) {
+        console.log("[BACKEND] Start tracking API success");
+      } else {
+        console.log("[BACKEND] Start tracking API failed:", response.status);
+      }
+    } catch (err) {
+      console.log("[BACKEND] Start tracking API error:", err.message);
+    }
+  };
+
+  // Call backend to stop tracking
+  const callBackendStopTracking = async () => {
+    try {
+      const headers = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      
+      const response = await fetch(`${API_BASE_URL}/api/location/stop`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ busId }),
+      });
+      
+      if (response.ok) {
+        console.log("[BACKEND] Stop tracking API success");
+      } else {
+        console.log("[BACKEND] Stop tracking API failed:", response.status);
+      }
+    } catch (err) {
+      console.log("[BACKEND] Stop tracking API error:", err.message);
+    }
+  };
+
   // Start tracking with watchPositionAsync
   const startTracking = async () => {
     if (locationSubscriptionRef.current) {
@@ -584,6 +642,16 @@ export default function DriverTrackingScreen({ token }) {
     }
 
     try {
+      // Get current location immediately for backend start API
+      const currentLoc = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High
+      });
+      const { latitude, longitude } = currentLoc.coords;
+      setCurrentLocation({ latitude, longitude });
+      
+      // Call backend to start tracking (emits BUS_LOCATION_UPDATE immediately)
+      await callBackendStartTracking(latitude, longitude);
+      
       // BATTERY OPTIMIZED: Use watchPositionAsync for efficient GPS
       const subscription = await Location.watchPositionAsync(
         {
@@ -607,6 +675,31 @@ export default function DriverTrackingScreen({ token }) {
       setStatus("Tracking active (optimized)");
       console.log("[TRACKING] watchPositionAsync started");
 
+      // Guarantee update after START (avoids freeze when GPS is slow)
+      setTimeout(async () => {
+        try {
+          const loc = await Location.getCurrentPositionAsync({
+            accuracy: Location.Accuracy.High
+          });
+          
+          await fetch(`${API_BASE_URL}/api/location/update`, {
+            method: "POST",
+            headers: { 
+              "Content-Type": "application/json",
+              ...(token && { "Authorization": `Bearer ${token}` })
+            },
+            body: JSON.stringify({
+              busId,
+              lat: loc.coords.latitude,
+              lng: loc.coords.longitude,
+            }),
+          });
+          console.log("[TRACKING] Guaranteed update sent after start");
+        } catch (e) {
+          console.log("[TRACKING] Retry update failed:", e.message);
+        }
+      }, 3000);
+
       // Also start background tracking (works even when app is killed)
       await startBackgroundTracking();
       // Persist busId and token for background task access
@@ -628,6 +721,9 @@ export default function DriverTrackingScreen({ token }) {
 
     // Stop background tracking
     await stopBackgroundTracking();
+    
+    // Call backend to stop tracking (emits BUS_OFFLINE)
+    await callBackendStopTracking();
 
     // Clear any pending retries
     if (pendingRetryRef.current) {
