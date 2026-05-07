@@ -21,7 +21,7 @@ export default function FullMapScreen({ route }) {
 
   // Default center (Chennai) - prevents crash when no route params
   const DEFAULT_CENTER = { latitude: 13.0827, longitude: 80.2707 };
-  const { buses: contextBuses, followBusId, setFollowBusId, setUserLocation, busStops } = useBus();
+  const { buses: contextBuses, socket, followBusId, setFollowBusId, setUserLocation, busStops } = useBus();
   const { buses: routeBuses, userLocation: routeUserLocation, center: routeCenter } = route?.params || {};
 
   // Convert context buses (object) to array and merge with route buses
@@ -131,12 +131,6 @@ export default function FullMapScreen({ route }) {
         webViewRef.current?.postMessage(JSON.stringify({ type: "PONG" }));
       }
 
-      // FOLLOW_STOPPED from WebView (user dragged map)
-      if (data.type === "FOLLOW_STOPPED") {
-        console.log("[FullMap] FOLLOW_STOPPED from WebView");
-        setFollowBusId(null);
-      }
-
       // BUS_SELECTED from WebView (user tapped marker)
       if (data.type === "BUS_SELECTED") {
         console.log("[FullMap] BUS_SELECTED:", data.busId);
@@ -224,6 +218,32 @@ export default function FullMapScreen({ route }) {
     }));
     console.log("[RN] Toggle state sent to WebView:", showNearestRoute);
   }, [showNearestRoute]);
+
+  // Handle BUS_OFFLINE from socket - send to WebView to remove marker
+  useEffect(() => {
+    if (!socket) return;
+
+    const handleBusOffline = (data) => {
+      const busId = typeof data === 'string' ? data : data?.busId;
+      console.log("[FullMap RN] BUS_OFFLINE:", busId);
+
+      if (webViewRef.current && webViewReady) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "BUS_OFFLINE",
+          busId: busId
+        }));
+      }
+
+      // Clear follow ONLY if this bus was being followed
+      if (followBusId === busId) {
+        console.log("[FullMap RN] Clearing follow for offline bus:", busId);
+        setFollowBusId(null);
+      }
+    };
+
+    socket.on("BUS_OFFLINE", handleBusOffline);
+    return () => socket.off("BUS_OFFLINE", handleBusOffline);
+  }, [socket, webViewReady, followBusId, setFollowBusId]);
 
   const mapHTML = useMemo(
     () => `
@@ -433,24 +453,7 @@ export default function FullMapScreen({ route }) {
             window.map.createPane('busPopupPane');
             window.map.getPane('busPopupPane').style.zIndex = 650;
             
-            // 2b) SMOOTH CAMERA FOLLOW STATE
-            window.__followState = {
-              lastUpdate: 0,
-              lastLat: null,
-              lastLng: null,
-              isAnimating: false,
-              isFollowing: false
-            };
-            
-            // Stop follow on user drag
-            window.map.on('dragstart', function() {
-              if (window.__followBusId) {
-                window.ReactNativeWebView.postMessage(JSON.stringify({
-                  type: 'FOLLOW_STOPPED',
-                  reason: 'USER_DRAG'
-                }));
-              }
-            });
+            // NOTE: Dragging map does NOT unfollow - follow is only controlled by SET_FOLLOW
 
             // 3) GLOBAL STATE (AFTER MAP INIT)
             window.busMarkers = {};
@@ -529,60 +532,6 @@ export default function FullMapScreen({ route }) {
               if (speedEl) {
                 speedEl.style.display = 'none';
               }
-            }
-            
-            // SMOOTH CAMERA FOLLOW with event-based synchronization
-            function smoothFollowCamera(lat, lng) {
-              if (!window.map) return;
-              
-              const state = window.__followState;
-              
-              // Skip if animation in progress (prevent overlap/jitter)
-              if (state.isAnimating) return;
-              
-              const now = Date.now();
-              
-              // Calculate distance from last position
-              let distance = 0;
-              if (state.lastLat !== null && state.lastLng !== null) {
-                distance = haversineMeters(state.lastLat, state.lastLng, lat, lng);
-              }
-              
-              // Hybrid throttle: time (300ms) OR distance (>20m)
-              const timeOk = now - state.lastUpdate > 300;
-              const distanceOk = distance > 20;
-              if (!timeOk && !distanceOk && state.lastLat !== null) return;
-              
-              // Always ignore tiny movements (<5m)
-              if (distance < 5 && state.lastLat !== null) return;
-              
-              // Update state
-              state.lastLat = lat;
-              state.lastLng = lng;
-              state.lastUpdate = now;
-              state.isFollowing = true;
-              
-              // Determine animation duration based on distance
-              // Large jumps (>30m) = faster (0.5s), small moves = slower (0.8s)
-              const duration = distance > 30 ? 0.5 : 0.8;
-              
-              // Lock animation to prevent overlapping
-              state.isAnimating = true;
-              
-              // Event-based unlock: reset when animation completes
-              const onMoveEnd = function() {
-                state.isAnimating = false;
-                window.map.off('moveend', onMoveEnd);
-              };
-              window.map.once('moveend', onMoveEnd);
-              
-              // Smooth flyTo with dynamic duration, keep zoom constant
-              const currentZoom = window.map.getZoom();
-              window.map.flyTo([lat, lng], currentZoom, {
-                animate: true,
-                duration: duration,
-                easeLinearity: 0.25
-              });
             }
             
             function showSpeedBadge(busId) {
@@ -734,36 +683,8 @@ export default function FullMapScreen({ route }) {
             function updateBusMarkers(buses) {
               if (!window.map || !buses) return;
 
-              const activeIds = new Set(Object.keys(buses));
-
-              // Followed bus went offline - reset follow state
-              if (window.__followBusId && !activeIds.has(window.__followBusId)) {
-                // Reset speedometer when followed bus goes offline
-                resetSpeedometer();
-                
-                window.__followBusId = null;
-                
-                // Reset camera follow state
-                const offlineState = window.__followState;
-                offlineState.lastLat = null;
-                offlineState.lastLng = null;
-                offlineState.lastUpdate = 0;
-                offlineState.isAnimating = false;
-                offlineState.isFollowing = false;
-
-                window.ReactNativeWebView.postMessage(JSON.stringify({
-                  type: "FOLLOW_STOPPED",
-                  reason: "BUS_OFFLINE"
-                }));
-              }
-
-              // Remove stale markers
-              Object.keys(window.busMarkers).forEach(function(id) {
-                if (!activeIds.has(id)) {
-                  window.map.removeLayer(window.busMarkers[id]);
-                  delete window.busMarkers[id];
-                }
-              });
+              // Ensure persistent markers object (NEVER reassign)
+              const markers = window.busMarkers || (window.busMarkers = {});
 
               // Add/update markers
               Object.entries(buses).forEach(function(entry) {
@@ -778,22 +699,21 @@ export default function FullMapScreen({ route }) {
                 if (window.userLocation) {
                   eta = calculateETA(bus, window.userLocation);
                 }
-                const busData = { ...bus, eta, busId: id };
 
-                if (window.busMarkers[id]) {
+                if (markers[id]) {
                   // UPDATE EXISTING MARKER - no recreation
-                  const marker = window.busMarkers[id];
+                  const marker = markers[id];
                   marker.setLatLng(latlng);
 
-                  // Store full bus data on marker for optimistic updates
-                  marker.__busData = { ...bus, id, eta: busData.eta };
+                  // Merge new data with existing (preserves references)
+                  marker.__busData = { ...marker.__busData, ...bus, id, eta };
 
-                  // Update popup content for all markers (keeps popup in sync)
-                  updateBusPopup(marker, busData);
+                  // Update popup using marker.__busData (single source)
+                  updateBusPopup(marker, marker.__busData);
 
-                  // Update speed badge if this is the followed bus
-                  if (window.__followBusId === id) {
-                    updateSpeedBadge(id, bus.speed);
+                  // Update speed badge using marker.__busData.speed (single source)
+                  if (marker.__busData.speed !== undefined) {
+                    updateSpeedBadge(id, marker.__busData.speed);
                   }
 
                   // Update z-index based on follow state
@@ -804,9 +724,15 @@ export default function FullMapScreen({ route }) {
                   } else {
                     marker.setZIndexOffset(0);
                   }
+
+                  // Event-driven follow: camera tracks bus on location update
+                  if (window.__followBusId === id && !window.__isUserInteracting) {
+                    throttledFollow(bus.lat, bus.lng);
+                  }
+
                 } else {
                   // CREATE NEW MARKER - only once (in busesPane for z-order)
-                  // Use busIconWithBadge for speed badge support
+                  const busData = { ...bus, id, eta };
                   const marker = L.marker(latlng, { icon: busIconWithBadge, pane: 'busesPane' }).addTo(window.map);
                   
                   // Cache speed element reference immediately
@@ -815,8 +741,8 @@ export default function FullMapScreen({ route }) {
                     marker.__speedEl = el.querySelector('.speed-badge');
                   }
 
-                  // Store full bus data on marker for optimistic updates
-                  marker.__busData = { ...bus, id, eta: busData.eta };
+                  // Store full bus data on marker
+                  marker.__busData = busData;
 
                   // Show speed badge if this bus is already being followed
                   if (window.__followBusId === id) {
@@ -824,7 +750,7 @@ export default function FullMapScreen({ route }) {
                   }
 
                   // Update speedometer ONLY if this bus is being followed
-                  if (window.__followBusId === id && bus.speed !== undefined) {
+                  if (window.__followBusId === id && busData.speed !== undefined) {
                     updateSpeedometer(busData);
                   }
 
@@ -837,7 +763,6 @@ export default function FullMapScreen({ route }) {
                   });
 
                   // Bind popup with modern UI (only once, in busPopupPane)
-                  // autoClose: false and closeOnClick: false for persistent popup
                   marker.bindPopup(createPopupHTML(busData), { 
                     pane: 'busPopupPane',
                     autoClose: false,
@@ -849,16 +774,28 @@ export default function FullMapScreen({ route }) {
                     marker.setZIndexOffset(2000);
                   }
 
-                  window.busMarkers[id] = marker;
-                }
+                  markers[id] = marker;
 
-                // Update popup content for all markers (keeps popup in sync)
-                updateBusPopup(window.busMarkers[id], busData);
-
-                // SMOOTH CAMERA FOLLOW for followed bus
-                if (window.__followBusId === id) {
-                  smoothFollowCamera(bus.lat, bus.lng);
+                  // Event-driven follow for newly created marker
+                  if (window.__followBusId === id && !window.__isUserInteracting) {
+                    throttledFollow(bus.lat, bus.lng);
+                  }
                 }
+              });
+            }
+
+            // EVENT-DRIVEN FOLLOW with 500ms throttle
+            let lastFollowTime = 0;
+            function throttledFollow(lat, lng) {
+              const now = Date.now();
+              if (now - lastFollowTime < 500) return; // Throttle: max once per 500ms
+              lastFollowTime = now;
+              
+              if (!window.map || !window.__followBusId || window.__isUserInteracting) return;
+              
+              window.map.flyTo([lat, lng], window.map.getZoom(), {
+                animate: true,
+                duration: 0.5
               });
             }
 
@@ -906,6 +843,9 @@ window.__highlightedStopId = null; // Currently highlighted stop
 window.__lastNearestDistance = Infinity; // For hysteresis
 window.__nearestRouteLayer = null; // Polyline for nearest stop route
 window.__showNearestRoute = false; // Route toggle state
+window.__lastUserLocation = null; // Cached user location
+window.__lastOsrmRequest = 0; // Throttle OSRM requests
+window.__osrmPending = false; // Prevent duplicate requests
 
 // Bus stop icon
 function createStopIcon(name) {
@@ -1051,14 +991,69 @@ function highlightNearestStop(userLat, userLng) {
   }
 }
 
-// Update nearest route polyline
-function updateNearestRoute(lat, lng) {
-  if (!window.map) return;
-
-  if (!window.__busStops || window.__busStops.length === 0) {
-    console.log("[WEBVIEW] No bus stops available");
-    return;
+// Fetch OSRM route
+async function fetchOsrmRoute(fromLat, fromLng, toLat, toLng) {
+  if (Date.now() - window.__lastOsrmRequest < 1500) {
+    console.log("[OSRM] throttled");
+    return null;
   }
+
+  window.__lastOsrmRequest = Date.now();
+
+  try {
+    const url =
+      "https://router.project-osrm.org/route/v1/walking/" +
+      fromLng + "," + fromLat + ";" +
+      toLng + "," + toLat +
+      "?overview=full&geometries=geojson";
+
+    console.log("[OSRM URL]", url);
+
+    const res = await fetch(url);
+    const data = await res.json();
+
+    console.log("[OSRM RESPONSE]", data);
+
+    if (!data.routes || data.routes.length === 0) {
+      return null;
+    }
+
+    const coords = data.routes[0].geometry.coordinates;
+
+    return coords.map(function(c) {
+      return [c[1], c[0]];
+    });
+
+  } catch (e) {
+    console.log("[OSRM ERROR]", e);
+    return null;
+  }
+}
+
+// Draw straight line fallback
+function drawStraightLine(lat, lng, nearest) {
+  if (window.__nearestRouteLayer) {
+    window.map.removeLayer(window.__nearestRouteLayer);
+  }
+
+  window.__nearestRouteLayer = L.polyline(
+    [[lat, lng], [nearest.lat, nearest.lng]],
+    {
+      color: '#007AFF',
+      weight: 4,
+      dashArray: '8, 8'
+    }
+  ).addTo(window.map);
+  console.log("[WEBVIEW] Drew straight line to:", nearest.name);
+}
+
+// Update nearest route polyline (with OSRM)
+async function updateNearestRoute(lat, lng) {
+  if (!window.map) return;
+  if (!window.__busStops || window.__busStops.length === 0) return;
+
+  console.log("[WEBVIEW] Stops:", window.__busStops?.length);
+  console.log("[WEBVIEW] Location:", window.__lastUserLocation);
 
   let nearest = null;
   let minDist = Infinity;
@@ -1077,25 +1072,36 @@ function updateNearestRoute(lat, lng) {
     }
   });
 
-  if (!nearest) {
-    console.log("[WEBVIEW] No nearest stop found");
-    return;
-  }
+  if (!nearest) return;
 
-  console.log("[WEBVIEW] Nearest stop:", nearest.name);
+  const route = await fetchOsrmRoute(lat, lng, nearest.lat, nearest.lng);
 
+  // Remove old route AFTER getting new one
   if (window.__nearestRouteLayer) {
     window.map.removeLayer(window.__nearestRouteLayer);
   }
 
-  window.__nearestRouteLayer = L.polyline(
-    [[lat, lng], [nearest.lat, nearest.lng]],
-    {
+  if (route && route.length > 0) {
+    window.__nearestRouteLayer = L.polyline(route, {
       color: '#007AFF',
-      weight: 4,
-      dashArray: '8, 8'
-    }
-  ).addTo(window.map);
+      weight: 5,
+      opacity: 0.9
+    }).addTo(window.map);
+
+    console.log("[WEBVIEW] OSRM route drawn");
+  } else {
+    // fallback
+    window.__nearestRouteLayer = L.polyline(
+      [[lat, lng], [nearest.lat, nearest.lng]],
+      {
+        color: '#007AFF',
+        weight: 4,
+        dashArray: '8, 8'
+      }
+    ).addTo(window.map);
+
+    console.log("[WEBVIEW] Fallback straight line used");
+  }
 }
 
 // Render bus stops
@@ -1256,13 +1262,6 @@ window.map.on("zoomend", function() {
                   if (prevBusId !== newBusId) {
                     window.__followBusId = newBusId;
                     console.log("[WEBVIEW] FOLLOW_UPDATE:", window.__followBusId);
-                    
-                    // Reset camera follow state for new bus (prevents stale position interference)
-                    const state = window.__followState;
-                    state.lastLat = null;
-                    state.lastLng = null;
-                    state.lastUpdate = 0;
-                    state.isAnimating = false;
                   }
                   
                   // ALWAYS enforce UI state (handles reloads, late markers, lost refs)
@@ -1273,33 +1272,19 @@ window.map.on("zoomend", function() {
                   }
                   break;
 
-                case "FOLLOW_STOPPED":
-                  // Hide speed badge for previously followed bus
-                  if (window.__followBusId) {
-                    hideSpeedBadge(window.__followBusId);
+                case "BUS_OFFLINE":
+                  // Remove marker for offline bus
+                  if (data.busId && window.busMarkers[data.busId]) {
+                    const marker = window.busMarkers[data.busId];
+                    window.map.removeLayer(marker);
+                    delete window.busMarkers[data.busId];
+                    console.log("[WEBVIEW] Removed marker for offline bus:", data.busId);
                   }
-                  
-                  window.__followBusId = null;
-                  
-                  // Reset camera follow state
-                  const stopState = window.__followState;
-                  stopState.lastLat = null;
-                  stopState.lastLng = null;
-                  stopState.lastUpdate = 0;
-                  stopState.isAnimating = false;
-                  stopState.isFollowing = false;
-                  
-                  // Reset speedometer when follow stops
-                  resetSpeedometer();
-
-                  if (data.reason === "BUS_OFFLINE") {
-                    if (window.userMarker && window.map) {
-                      const pos = window.userMarker.getLatLng();
-                      window.map.flyTo(pos, 15, {
-                        animate: true,
-                        duration: 0.6
-                      });
-                    }
+                  // Clear follow ONLY if this bus was being followed
+                  if (window.__followBusId === data.busId) {
+                    window.__followBusId = null;
+                    resetSpeedometer();
+                    console.log("[WEBVIEW] Cleared follow for offline bus:", data.busId);
                   }
                   break;
 
@@ -1316,15 +1301,15 @@ window.map.on("zoomend", function() {
               window.addEventListener("message", handleMessage);
             }
 
-            // 10) STOP FOLLOW ON DRAG
+            // 10) USER INTERACTION GUARD (pauses follow during drag, doesn't stop it)
+            window.__isUserInteracting = false;
             window.map.on("dragstart", () => {
-              if (window.__followBusId) {
-                window.__followBusId = null;
-                window.ReactNativeWebView.postMessage(JSON.stringify({
-                  type: "FOLLOW_STOPPED",
-                  reason: "USER_DRAG"
-                }));
-              }
+              window.__isUserInteracting = true;
+            });
+            window.map.on("dragend", () => {
+              setTimeout(() => {
+                window.__isUserInteracting = false;
+              }, 2000);
             });
 
             // 11) MAP READY
@@ -1393,26 +1378,17 @@ window.map.on("zoomend", function() {
         onMessage={handleWebViewMessage}
         style={{ flex: 1 }}
       />
-      <TouchableOpacity
-        style={[styles.recenterButton, isRecentering && styles.recenterButtonActive]}
-        onPress={handleRecenter}
-        activeOpacity={0.8}
-      >
-        <Text style={styles.recenterIcon}>⌖</Text>
-      </TouchableOpacity>
-      {/* Nearest Route Toggle Button - Bottom Overlay */}
-      <View
-        pointerEvents="box-none"
-        style={{
-          position: 'absolute',
-          bottom: 20,
-          left: 20,
-          right: 20,
-          zIndex: 999,
-          elevation: 10
-        }}
-      >
+      {/* Bottom Action Bar */}
+      <View style={styles.actionBar}>
         <TouchableOpacity
+          style={styles.recenterButton}
+          onPress={handleRecenter}
+          activeOpacity={0.8}
+        >
+          <Text style={styles.recenterIcon}>⌖</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.routeButton}
           onPress={() => {
             setShowNearestRoute(prev => {
               const newValue = !prev;
@@ -1420,15 +1396,9 @@ window.map.on("zoomend", function() {
               return newValue;
             });
           }}
-          style={{
-            backgroundColor: '#007AFF',
-            paddingVertical: 14,
-            borderRadius: 14,
-            alignItems: 'center'
-          }}
         >
-          <Text style={{ color: '#fff', fontWeight: '600' }}>
-            {showNearestRoute ? "Hide Nearest Stop" : "Show Nearest Stop"}
+          <Text style={styles.routeButtonText}>
+            {showNearestRoute ? 'Hide Route' : 'Show Route'}
           </Text>
         </TouchableOpacity>
       </View>
@@ -1441,25 +1411,43 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#fff",
   },
-  recenterButton: {
-    position: 'absolute',
-    bottom: 20,
-    right: 20,
-    backgroundColor: '#fff',
-    borderRadius: 30,
+  actionBar: {
+    flexDirection: 'row',
     padding: 12,
-    elevation: 6,
+    gap: 8,
+    backgroundColor: '#fff',
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+  },
+  recenterButton: {
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    padding: 12,
+    elevation: 3,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.2,
     shadowRadius: 4,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
   },
   recenterButtonActive: {
     backgroundColor: '#e0e0e0',
-    transform: [{ scale: 0.9 }],
   },
   recenterIcon: {
     fontSize: 20,
+  },
+  routeButton: {
+    flex: 1,
+    backgroundColor: '#007AFF',
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  routeButtonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '600',
   },
   selectionPanel: {
     position: 'absolute',

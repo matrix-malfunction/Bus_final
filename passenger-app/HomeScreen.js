@@ -35,845 +35,474 @@ const BusStopCard = ({ stopName, distance, nextBusTime, onPress }) => (
 );
 
 // Mini Map Component - VIEW ONLY
-const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, followBusId, setFollowBusId, busStops, showNearestRoute, setShowNearestRoute }) => {
+const MiniMap = React.memo(({ webViewRef, setWebViewReady, onPress, buses, userLocation, followBusId, setFollowBusId, busStops, showNearestRoute, setShowNearestRoute }) => {
   const mapHTML = `
 <!DOCTYPE html>
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
-    html, body, #map { height: 100%; margin: 0; }
-
-    /* Beacon pulse animation - Google Maps style */
+    html, body { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden; }
+    #map { position: absolute; top: 0; bottom: 0; left: 0; right: 0; }
+    /* Beacon pulse animation - Google Maps style (same as FullMap) */
     .beacon-container { position: relative; }
     .beacon-dot {
-      width: 12px;
-      height: 12px;
-      background: #007AFF;
-      border-radius: 50%;
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      z-index: 2;
+      width: 12px; height: 12px; background: #007AFF; border-radius: 50%;
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 2;
     }
     .beacon-pulse {
-      width: 40px;
-      height: 40px;
-      background: rgba(0,122,255,0.3);
-      border-radius: 50%;
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      animation: pulse-ring 1.5s ease-out infinite;
-      z-index: 1;
+      width: 20px; height: 20px; background: rgba(0,122,255,0.3); border-radius: 50%;
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      animation: pulse-ring 1.5s ease-out infinite; z-index: 1;
     }
     @keyframes pulse-ring {
       0% { transform: translate(-50%, -50%) scale(0.5); opacity: 1; }
       100% { transform: translate(-50%, -50%) scale(1.5); opacity: 0; }
     }
-
-    /* Modern Popup Styles */
-    .bus-popup { padding: 12px; min-width: 160px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-    .bus-popup-header { font-weight: 600; font-size: 14px; margin-bottom: 8px; color: #333; }
-    .bus-popup-row { font-size: 12px; color: #666; margin: 4px 0; }
-
-    /* Toggle Switch */
-    .follow-toggle { display: flex; align-items: center; margin-top: 8px; cursor: pointer; }
-    .follow-toggle input { display: none; }
-    .toggle-slider {
-      width: 40px; height: 20px; background: #ccc; border-radius: 10px;
-      position: relative; transition: 0.3s; margin-right: 8px;
-    }
-    .toggle-slider::after {
-      content: ''; position: absolute; width: 16px; height: 16px;
-      background: white; border-radius: 50%; top: 2px; left: 2px;
-      transition: 0.3s;
-    }
-    .follow-toggle input:checked + .toggle-slider { background: #007AFF; }
-    .follow-toggle input:checked + .toggle-slider::after { left: 22px; }
-    .toggle-label { font-size: 12px; color: #333; }
-
-    /* Modern Bus Stop Marker */
-    .bus-stop-marker {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-    }
-    .bus-stop-icon {
-      width: 28px;
-      height: 28px;
-      background: white;
-      border: 2px solid #333;
+    /* Bus stop markers - visible and interactive like FullMap */
+    .bus-stop-marker { display: flex; justify-content: center; align-items: center; }
+    .stop-dot {
+      width: 18px;
+      height: 18px;
+      background: #dc2626;
+      border: 3px solid white;
       border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-      font-size: 14px;
-    }
-    .bus-stop-label {
-      background: white;
-      padding: 3px 8px;
-      border-radius: 4px;
-      font-size: 10px;
-      font-weight: 600;
-      margin-top: 4px;
-      white-space: nowrap;
-      max-width: 80px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
-      color: #333;
-    }
-    .bus-stop-highlighted {
-      background: #007AFF;
-      border-color: #0051D5;
-      width: 36px;
-      height: 36px;
-      font-size: 18px;
-      box-shadow: 0 4px 12px rgba(0,122,255,0.4);
-    }
-    .bus-stop-highlighted-label {
-      background: #007AFF;
-      color: white;
+      box-shadow: 0 0 6px rgba(0,0,0,0.6);
     }
   </style>
 </head>
 <body>
-  <div id="map" style="height:100vh;"></div>
-  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // Wrap ALL logic inside DOMContentLoaded to ensure Leaflet + DOM are ready
-    document.addEventListener("DOMContentLoaded", function() {
-      console.log("[WEBVIEW] DOMContentLoaded - Initializing map...");
+// Initialize on DOM ready
+document.addEventListener("DOMContentLoaded", function() {
+  // DEBUG: Make body visible
+  document.body.style.background = "#f0f0f0";
+  
+  function send(msg) {
+    window.ReactNativeWebView?.postMessage(
+      JSON.stringify({ type: "LOG", message: msg })
+    );
+  }
 
-      // 1. CREATE MAP FIRST (all default controls disabled)
-      var map = L.map('map', {
+  // Global error handler
+  window.onerror = function(msg, url, line) {
+    send("JS ERROR: " + msg + " at line " + line);
+    return true;
+  };
+
+  send("SCRIPT STARTED");
+
+  // Guard: Leaflet must be loaded
+  if (typeof L === "undefined") {
+    send("Leaflet FAILED - L is undefined");
+    return;
+  }
+
+  // Message queue for early messages
+  window.__messageQueue = window.__messageQueue || [];
+  window.__messageHandlerAttached = window.__messageHandlerAttached || false;
+  window.__queueProcessed = window.__queueProcessed || false;
+
+  try {
+    // Validate map: check if it's a valid Leaflet map instance (multiple methods)
+    const isValidMap = window.map && 
+                       typeof window.map.eachLayer === "function" &&
+                       typeof window.map.setView === "function" &&
+                       typeof window.map.addLayer === "function";
+
+    // Create or recreate map if invalid
+    if (!isValidMap) {
+      send("Creating new map (invalid or missing)");
+      
+      // Reset user marker so it gets recreated on new map
+      window.__userMarker = null;
+      
+      window.map = L.map("map", {
         zoomControl: false,
-        attributionControl: false
-      }).setView([13.0827, 80.2707], 13);
-      window.map = map; // Expose globally
+        attributionControl: false,
+        preferCanvas: true,  // Enable canvas rendering for performance
+        zoomAnimation: false,  // Disable zoom animations
+        fadeAnimation: false,  // Disable tile fade animations
+        markerZoomAnimation: false  // Disable marker zoom animations
+      }).setView([13.0827, 80.2707], 15);
 
-      // 2. REMOVE ANY INJECTED LAYER CONTROLS (safeguard)
-      setTimeout(function() {
-        document.querySelectorAll('.leaflet-control-layers').forEach(function(el) { el.remove(); });
-        document.querySelectorAll('.leaflet-control-attribution').forEach(function(el) { el.remove(); });
-      }, 0);
+      send("MAP CREATED");
+    } else {
+      send("Map already valid, skipping creation");
+    }
 
-      // 3. ADD TILE LAYER
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19
-      }).addTo(map);
-
-      // 3a. CREATE PANES FOR PROPER Z-ORDERING
-      // Bus stops below buses for clean layering
-      map.createPane('busStopsPane');
-      map.getPane('busStopsPane').style.zIndex = 400;
-      
-      map.createPane('busesPane');
-      map.getPane('busesPane').style.zIndex = 500;
-      
-      // Popup panes (above markers)
-      map.createPane('busStopsPopupPane');
-      map.getPane('busStopsPopupPane').style.zIndex = 600;
-      
-      map.createPane('busPopupPane');
-      map.getPane('busPopupPane').style.zIndex = 650;
-
-      // 3b. CREATE GLOBALS AFTER MAP EXISTS
-      window.__MAP_READY__ = false;
-      window.__MAP_READY_SENT__ = false;
-      window.__BUS_LISTENER_ATTACHED__ = false;
-      window.__pendingBusStopRender = false;
-      window.busMarkers = {};
-      window.userMarker = null;
-      window.userPulse = null;
-      window.__busStops = [];
-      window.__busStopMarkers = {};
-      window.__stopBusMap = {}; // stopId → [busIds]
-      window.__highlightedStopId = null; // Currently highlighted stop
-      window.__lastNearestDistance = Infinity; // For hysteresis
-      window.__nearestRouteLayer = null; // Polyline for nearest stop route
-      window.__showNearestRoute = false; // Route toggle state
-
-      // Bus stop icon
-      function createStopIcon(name) {
-        return L.divIcon({
-          html: '<div class="bus-stop-marker">' +
-            '<div class="bus-stop-icon">🛑</div>' +
-            '<div class="bus-stop-label">' + (name || 'Stop') + '</div>' +
-            '</div>',
-          className: '',
-          iconSize: [80, 60],
-          iconAnchor: [40, 60]
-        });
-      }
-
-      // Haversine distance in meters
-      function haversine(lat1, lng1, lat2, lng2) {
-        const R = 6371000;
-        const φ1 = lat1 * Math.PI / 180;
-        const φ2 = lat2 * Math.PI / 180;
-        const Δφ = (lat2 - lat1) * Math.PI / 180;
-        const Δλ = (lng2 - lng1) * Math.PI / 180;
-        const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
-                  Math.cos(φ1) * Math.cos(φ2) *
-                  Math.sin(Δλ/2) * Math.sin(Δλ/2);
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-        return R * c;
-      }
-
-      // Compute nearest stop for each bus (50m threshold)
-      function computeStopBusMapping(buses) {
-        if (!buses || !window.__busStops) return;
-
-        // Reset mapping
-        window.__stopBusMap = {};
-
-        buses.forEach(function(bus) {
-          if (!bus || !bus.lat || !bus.lng || !bus.busId) return;
-
-          let nearestStop = null;
-          let minDistance = Infinity;
-
-          window.__busStops.forEach(function(stop) {
-            if (!stop.id || !stop.lat || !stop.lng) return;
-
-            const distance = haversine(bus.lat, bus.lng, stop.lat, stop.lng);
-
-            if (distance < minDistance && distance < 50) { // 50m threshold
-              minDistance = distance;
-              nearestStop = stop;
-            }
-          });
-
-          if (nearestStop) {
-            if (!window.__stopBusMap[nearestStop.id]) {
-              window.__stopBusMap[nearestStop.id] = [];
-            }
-            window.__stopBusMap[nearestStop.id].push(bus.busId);
-          }
-        });
-      }
-
-      // Update stop popup with buses
-      function updateStopPopups() {
-        Object.keys(window.__busStopMarkers).forEach(function(stopId) {
-          const marker = window.__busStopMarkers[stopId];
-          if (!marker) return;
-
-          const busIds = window.__stopBusMap[stopId] || [];
-          const stopName = marker.__stopName || 'Bus Stop';
-
-          let content = '<b>' + stopName + '</b><br>';
-
-          if (busIds.length > 0) {
-            content += '<span style="font-size:12px;color:#666;">Buses: ' + busIds.length + '</span>';
-          } else {
-            content += '<span style="font-size:12px;color:#999;">No buses nearby</span>';
-          }
-
-          if (marker.getPopup()) {
-            marker.setPopupContent(content);
-          }
-        });
-      }
-
-      // Highlight nearest stop to user
-      function highlightNearestStop(userLat, userLng) {
-        if (!window.__busStops || !window.__busStops.length) return;
-
-        let nearestStop = null;
-        let minDistance = Infinity;
-
-        window.__busStops.forEach(function(stop) {
-          if (!stop.id || !stop.lat || !stop.lng) return;
-
-          const distance = haversine(userLat, userLng, stop.lat, stop.lng);
-
-          if (distance < minDistance && distance < 500) { // 500m threshold
-            minDistance = distance;
-            nearestStop = stop;
-          }
-        });
-
-        // Hysteresis: only change if distance changed by >20m
-        if (nearestStop) {
-          const distanceChange = Math.abs(minDistance - window.__lastNearestDistance);
-
-          if (nearestStop.id !== window.__highlightedStopId && distanceChange > 20) {
-            // Reset previous highlight
-            if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
-              const prevMarker = window.__busStopMarkers[window.__highlightedStopId];
-              const prevStopName = prevMarker.__stopName || 'Stop';
-              prevMarker.setIcon(createStopIcon(prevStopName));
-            }
-
-            // Highlight new stop
-            if (window.__busStopMarkers[nearestStop.id]) {
-              const marker = window.__busStopMarkers[nearestStop.id];
-              marker.setIcon(L.divIcon({
-                html: '<div class="bus-stop-marker">' +
-                  '<div class="bus-stop-icon bus-stop-highlighted">🛑</div>' +
-                  '<div class="bus-stop-label bus-stop-highlighted-label">' + nearestStop.name + '</div>' +
-                  '</div>',
-                className: '',
-                iconSize: [80, 60],
-                iconAnchor: [40, 60]
-              }));
-            }
-
-            window.__highlightedStopId = nearestStop.id;
-            window.__lastNearestDistance = minDistance;
-            console.log("[WEBVIEW] Highlighted nearest stop:", nearestStop.name, "Distance:", minDistance.toFixed(0) + "m");
-          }
-        } else {
-          // Reset highlight if no stop within 500m
-          if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
-            const prevMarker = window.__busStopMarkers[window.__highlightedStopId];
-            const prevStopName = prevMarker.__stopName || 'Stop';
-            prevMarker.setIcon(createStopIcon(prevStopName));
-            window.__highlightedStopId = null;
-            window.__lastNearestDistance = Infinity;
-          }
+    // Ensure tile layer is attached (runs every time)
+    if (window.map && typeof window.map.eachLayer === "function") {
+      // Check if tile layer already exists
+      let hasTileLayer = false;
+      window.map.eachLayer(function(layer) {
+        if (layer instanceof L.TileLayer) {
+          hasTileLayer = true;
         }
-      }
+      });
 
-      // Update nearest route polyline
-      function updateNearestRoute(lat, lng) {
-        if (!window.map) return;
-
-        if (!window.__busStops || window.__busStops.length === 0) {
-          console.log("[WEBVIEW] No bus stops available");
-          return;
-        }
-
-        let nearest = null;
-        let minDist = Infinity;
-
-        window.__busStops.forEach(stop => {
-          if (!stop.lat || !stop.lng) return;
-
-          const d = Math.sqrt(
-            Math.pow(stop.lat - lat, 2) +
-            Math.pow(stop.lng - lng, 2)
-          );
-
-          if (d < minDist) {
-            minDist = d;
-            nearest = stop;
-          }
-        });
-
-        if (!nearest) {
-          console.log("[WEBVIEW] No nearest stop found");
-          return;
-        }
-
-        console.log("[WEBVIEW] Nearest stop:", nearest.name);
-
-        if (window.__nearestRouteLayer) {
-          window.map.removeLayer(window.__nearestRouteLayer);
-        }
-
-        window.__nearestRouteLayer = L.polyline(
-          [[lat, lng], [nearest.lat, nearest.lng]],
+      // Only add tile layer if not present (optimized for performance)
+      if (!hasTileLayer) {
+        const tiles = L.tileLayer(
+          "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
           {
-            color: '#007AFF',
-            weight: 4,
-            dashArray: '8, 8'
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+            subdomains: 'abcd',
+            updateWhenIdle: false,
+            updateWhenZooming: false,
+            keepBuffer: 8,      // Increased buffer for faster panning
+            reuseTiles: true,   // Reuse tiles from previous views
+            crossOrigin: true   // Enable CORS for better caching
           }
-        ).addTo(window.map);
-      }
-
-      // Render bus stops
-      function renderBusStops() {
-        if (!window.map || !window.__busStops) return;
-
-        const zoom = window.map.getZoom();
-
-        if (zoom < 14) {
-          Object.values(window.__busStopMarkers).forEach(m => {
-            if (window.map.hasLayer(m)) window.map.removeLayer(m);
-          });
-          return;
-        }
-
-        window.__busStops.forEach(stop => {
-          if (!stop.id || !stop.lat || !stop.lng) return;
-
-          let marker = window.__busStopMarkers[stop.id];
-
-          if (!marker) {
-            marker = L.marker([stop.lat, stop.lng], {
-              icon: createStopIcon(stop.name),
-              pane: 'busStopsPane'
-            }).addTo(window.map);
-
-            marker.__stopName = stop.name;
-            marker.bindPopup(
-              '<b>' + stop.name + '</b><br><span style="font-size:12px;color:#999;">Loading...</span>'
-            );
-
-            window.__busStopMarkers[stop.id] = marker;
-          } else {
-            marker.setLatLng([stop.lat, stop.lng]);
-            if (!window.map.hasLayer(marker)) marker.addTo(window.map);
-          }
-        });
-      }
-
-      // Zoom handler
-      window.map.on("zoomend", function() {
-        renderBusStops();
-      });
-
-      // 4. MAP READY HANDLER
-      function sendMapReady() {
-        if (window.__MAP_READY_SENT__) return;
-        if (!window.ReactNativeWebView) {
-          console.log("[WEBVIEW] ReactNativeWebView not available");
-          return;
-        }
-        window.ReactNativeWebView.postMessage(
-          JSON.stringify({ type: "MAP_READY" })
         );
-        window.__MAP_READY_SENT__ = true;
-        console.log("[WEBVIEW] MAP_READY sent");
+
+        // Comprehensive tile event logging
+        tiles.on("loading", function() { send("TILES LOADING..."); });
+        tiles.on("load", function(e) { send("TILES LOADED: " + (Object.keys(e?.target?._tiles || {}).length || "unknown") + " tiles"); });
+        tiles.on("tileerror", function(e) { send("TILE ERROR: " + (e?.coords?.z + "/" + e?.coords?.x + "/" + e?.coords?.y || "unknown")); });
+
+        tiles.addTo(window.map);
+        send("TILE LAYER ADDED");
+
+        // Event-based opacity control (tied to actual tile loading, not timeout)
+        const mapEl = document.getElementById("map");
+        if (mapEl) {
+          mapEl.style.transition = "opacity 0.15s ease";
+          
+          tiles.on("loading", () => {
+            mapEl.style.opacity = "0.5";
+          });
+          
+          tiles.on("load", () => {
+            mapEl.style.opacity = "1";
+          });
+        }
+
+        // Map ready state - no invalidateSize to avoid forced layout
+        window.map.whenReady(() => {
+          send("MAP READY");
+        });
+
+        // Zoom-based visibility control for bus stop markers
+        if (!window.__zoomListenerAttached) {
+          window.__zoomListenerAttached = true;
+          window.map.on("zoomend", () => {
+            const zoom = window.map.getZoom();
+            if (!window.__busStopMarkers) return;
+
+            Object.values(window.__busStopMarkers).forEach(marker => {
+              if (zoom >= 15) {
+                if (!window.map.hasLayer(marker)) {
+                  marker.addTo(window.map);
+                }
+              } else {
+                if (window.map.hasLayer(marker)) {
+                  window.map.removeLayer(marker);
+                }
+              }
+            });
+          });
+        }
+      } else {
+        send("TILE LAYER ALREADY EXISTS");
       }
+    } else {
+      send("ERROR: window.map is not valid for tile layer");
+    }
 
-      // 5. WHEN MAP IS ACTUALLY READY
-      map.whenReady(function() {
-        window.__MAP_READY__ = true;
-        console.log("[WEBVIEW] Map is ready");
+    // USER LOCATION with beacon - Exact GPS position (no prediction)
+    window.__lastUserLocation = window.__lastUserLocation || null;
+    window.__userMarker = window.__userMarker || null;
+    
+    function updateUserLocation(lat, lng) {
+      // Validate map is a valid Leaflet instance
+      if (!window.map || typeof window.map.addLayer !== "function") {
+        // Queue for later if map not ready
+        window.__messageQueue.push({ type: "USER_LOCATION", lat, lng });
+        return;
+      }
+      
+      const pos = [lat, lng];
+      window.__lastUserLocation = { lat, lng };
+      
+      // Create marker if missing (happens on first GPS or after map recreation)
+      if (!window.__userMarker) {
+        const pulseIcon = L.divIcon({
+          className: 'beacon-container',
+          html: '<div class="beacon-dot"></div><div class="beacon-pulse"></div>',
+          iconSize: [20, 20],
+          iconAnchor: [10, 10]
+        });
+        window.__userMarker = L.marker(pos, { icon: pulseIcon, zIndexOffset: 1000 }).addTo(window.map);
         
-        // Process any pending bus stop render
-        if (window.__pendingBusStopRender && window.__busStops && window.__busStops.length) {
-          console.log("[WEBVIEW] Processing pending bus stop render");
-          window.__pendingBusStopRender = false;
-          if (window.renderBusStops) window.renderBusStops();
+        // Add tooltip - show on click, hide on map move
+        window.__userMarker.bindTooltip("You are here", { 
+          direction: "top", 
+          offset: [0, -10],
+          permanent: false,
+          interactive: false
+        });
+        
+        // Click to show tooltip
+        window.__userMarker.on("click", function() {
+          window.__userMarker.openTooltip();
+        });
+        
+        // Map move hides tooltip (with guard to prevent duplicate listeners)
+        if (!window.__tooltipMoveListenerAttached) {
+          window.__tooltipMoveListenerAttached = true;
+          window.map.on("movestart", function() {
+            if (window.__userMarker) {
+              window.__userMarker.closeTooltip();
+            }
+          });
         }
         
-        sendMapReady();
-      });
-
-      // 6. FALLBACK TIMEOUT
-      setTimeout(function() {
-        if (!window.__MAP_READY_SENT__) {
-          console.log("[WEBVIEW] Fallback timeout - forcing MAP_READY");
-          window.__MAP_READY__ = true;
-          sendMapReady();
+        send("USER MARKER CREATED: " + lat.toFixed(6) + ", " + lng.toFixed(6));
+        // NO EARLY RETURN - continue to setLatLng below
+      }
+      
+      // ALWAYS update marker to EXACT GPS position (handles creation and updates)
+      if (window.__userMarker && window.__userMarker.setLatLng) {
+        window.__userMarker.setLatLng(pos);
+        send("USER LOCATION UPDATED: " + lat.toFixed(6) + ", " + lng.toFixed(6));
+      }
+    }
+    
+    // Process queued messages - ALWAYS run
+    function processQueuedMessages() {
+      while (window.__messageQueue.length > 0) {
+        const msg = window.__messageQueue.shift();
+        if (msg.type === "USER_LOCATION") {
+          updateUserLocation(msg.lat, msg.lng);
         }
-      }, 1500);
+      }
+    }
+    
+    // Message handler (ONLY ONE - hardened with document.addEventListener)
+    if (!window.__messageHandlerAttached) {
+      window.__messageHandlerAttached = true;
+      document.addEventListener("message", function(event) {
+        let data;
 
-      // 7. MESSAGE HANDLER
-      function handleMessage(event) {
         try {
-          if (!event || !event.data) return;
+          data = JSON.parse(event.data);
+        } catch (e) {
+          send("INVALID MESSAGE: " + event.data);
+          return;
+        }
 
-          var data;
-          try {
-            data = JSON.parse(event.data);
-          } catch (e) {
-            console.log("[WEBVIEW] JSON parse error:", e.message);
-            return;
-          }
+        if (!data || !data.type) {
+          send("INVALID FORMAT: missing type");
+          return;
+        }
 
-          console.log("[WEBVIEW] Received:", data.type);
+        send("RECEIVED: " + data.type);
 
-          switch (data.type) {
-            case "USER_LOCATION":
-              if (!window.map) return;
-              console.log("[WEBVIEW] USER_LOCATION received:", data.payload);
-              const lat = data.payload?.lat;
-              const lng = data.payload?.lng;
-              if (lat != null && lng != null) {
-                setUserLocation(Number(lat), Number(lng));
-                highlightNearestStop(Number(lat), Number(lng));
-                
-                // Store user location for route drawing
-                window.__lastUserLocation = {
-                  lat: Number(lat),
-                  lng: Number(lng)
-                };
-                
-                if (window.__showNearestRoute) {
-                  updateNearestRoute(Number(lat), Number(lng));
-                }
-              }
-              break;
+        switch (data.type) {
+          case "USER_LOCATION":
+            if (data.lat != null && data.lng != null) {
+              updateUserLocation(data.lat, data.lng);
+              send("USER_LOCATION processed: " + data.lat + ", " + data.lng);
+            } else {
+              send("USER_LOCATION missing lat/lng");
+            }
+            break;
 
-            case "TOGGLE_NEAREST_ROUTE":
-              window.__showNearestRoute = data.enabled;
-              console.log("[WEBVIEW] Toggle:", window.__showNearestRoute);
-              console.log("[WEBVIEW] Stops:", window.__busStops?.length);
-              console.log("[WEBVIEW] Last location:", window.__lastUserLocation);
+          case "BUS_UPDATE":
+            send("BUS_UPDATE received: " + (data.buses?.length || 0) + " buses");
+            break;
+
+          case "RECENTER":
+            send("RECENTER handler executing");
+            if (!window.map) {
+              send("RECENTER failed: map not ready");
+              return;
+            }
+
+            // Spam guard: prevent rapid recenter clicks
+            if (window.__lastRecenterTime && (Date.now() - window.__lastRecenterTime < 300)) {
+              send("RECENTER skipped: too soon");
+              return;
+            }
+            window.__lastRecenterTime = Date.now();
+
+            if (window.__lastUserLocation) {
+              const { lat, lng } = window.__lastUserLocation;
+              const currentCenter = window.map.getCenter();
+              const distance = currentCenter.distanceTo([lat, lng]);
               
-              if (!data.enabled) {
-                if (window.__nearestRouteLayer) {
-                  window.map.removeLayer(window.__nearestRouteLayer);
-                  window.__nearestRouteLayer = null;
-                }
+              const TARGET_ZOOM = 15;
+              
+              // Distance-based behavior with zoom to 15
+              if (distance < 500) {
+                // Close distance - fly to location with zoom animation
+                window.map.flyTo([lat, lng], TARGET_ZOOM, {
+                  duration: 0.3
+                });
+                send("RECENTERED (flyTo): " + lat.toFixed(6) + ", " + lng.toFixed(6) + " zoom: " + TARGET_ZOOM + " dist: " + Math.round(distance) + "m");
               } else {
-                // CRITICAL: draw immediately using last location
-                if (window.__lastUserLocation) {
-                  updateNearestRoute(
-                    window.__lastUserLocation.lat,
-                    window.__lastUserLocation.lng
-                  );
+                // Far distance - instant jump with target zoom
+                window.map.setView([lat, lng], TARGET_ZOOM, {
+                  animate: false
+                });
+                send("RECENTERED (setView): " + lat.toFixed(6) + ", " + lng.toFixed(6) + " zoom: " + TARGET_ZOOM + " dist: " + Math.round(distance) + "m");
+              }
+            } else {
+              send("RECENTER failed: no location available");
+            }
+            break;
+
+          case "BUS_STOPS":
+          case "INIT_BUS_STOPS":
+            const msgType = data.type;
+            send("RECEIVED: " + msgType + " with " + (data.stops?.length || 0) + " stops");
+            if (!window.map) {
+              send(msgType + " failed: map not ready");
+              return;
+            }
+            
+            // Initialize bus stop markers storage
+            if (!window.__busStopMarkers) {
+              window.__busStopMarkers = {};
+            }
+            
+            // Render bus stops (prevent duplicates, validate structure)
+            if (data.stops && Array.isArray(data.stops) && data.stops.length > 0) {
+              let added = 0;
+              data.stops.forEach(stop => {
+                // Validate required fields
+                if (!stop || !stop.id || !stop.lat || !stop.lng) {
+                  send("SKIP: invalid stop structure");
+                  return;
                 }
+                // Prevent duplicates
+                if (window.__busStopMarkers[stop.id]) return;
+                
+                // Create visible marker with divIcon (like FullMap)
+                const marker = L.marker([stop.lat, stop.lng], {
+                  icon: L.divIcon({
+                    className: "bus-stop-marker",
+                    html: '<div class="stop-dot"></div>',
+                    iconSize: [24, 24],
+                    iconAnchor: [12, 12]
+                  })
+                }).addTo(window.map);
+                
+                // Ensure markers are above tiles
+                marker.setZIndexOffset(1000);
+                
+                // Add popup with detailed info
+                marker.bindPopup(
+                  '<div style="font-size:12px;">' +
+                    '<strong>' + (stop.name || "Bus Stop") + '</strong><br/>' +
+                    'Lat: ' + stop.lat.toFixed(5) + '<br/>' +
+                    'Lng: ' + stop.lng.toFixed(5) +
+                  '</div>'
+                );
+                
+                window.__busStopMarkers[stop.id] = marker;
+                added++;
+              });
+              
+              // Fit map to show all stops (run once)
+              if (!window.__stopsFitted && Object.keys(window.__busStopMarkers).length > 0) {
+                const markers = Object.values(window.__busStopMarkers);
+                const bounds = markers.map(function(m) { return m.getLatLng(); });
+                window.map.fitBounds(bounds, { padding: [20, 20] });
+                window.__stopsFitted = true;
+                send(msgType + " fitBounds applied");
               }
-              break;
-
-            case "FOLLOW_UPDATE":
-              window.__followBusId = data.busId || null;
-              console.log("[WEBVIEW] FOLLOW_UPDATE:", window.__followBusId);
-              break;
-
-            case "ZOOM_IN":
-              if (window.map) window.map.zoomIn();
-              break;
-
-            case "ZOOM_OUT":
-              if (window.map) window.map.zoomOut();
-              break;
-
-            case "RECENTER":
-              if (window.map && window.userMarker) {
-                window.__isProgrammaticMove = true;
-                const pos = window.userMarker.getLatLng();
-                window.map.flyTo(pos, 15, { duration: 0.5 });
-              }
-              break;
-
-            case "INIT_BUS_STOPS":
-              if (!Array.isArray(data.stops)) {
-                console.log("[WEBVIEW] Invalid INIT_BUS_STOPS");
-                return;
-              }
-              window.__busStops = data.stops;
-
-              if (window.map) {
-                renderBusStops();
-              } else {
-                setTimeout(function() {
-                  if (window.map) renderBusStops();
-                }, 300);
-              }
-              break;
-
-            case "BUS_OFFLINE":
-              if (data.busId && window.busMarkers[data.busId]) {
-                if (window.map && window.map.removeLayer) {
-                  window.map.removeLayer(window.busMarkers[data.busId]);
-                }
-                delete window.busMarkers[data.busId];
-                if (window.followBusId === data.busId) {
-                  window.followBusId = null;
-                  if (window.userLocation && window.map && window.map.panTo) {
-                    window.map.panTo([window.userLocation.lat, window.userLocation.lng], { animate: true });
-                  }
-                }
-              }
-              break;
-
-            case "BUS_LOCATION_UPDATE":
-              if (!data || !data.busId) return;
-              updateBusMarker(data);
-              break;
-
-            case "BUS_UPDATE":
-              if (!Array.isArray(data.buses)) {
-                console.log("[WEBVIEW] Invalid BUS_UPDATE");
-                return;
-              }
-
-              // Process buses
-              data.buses.forEach(function(bus) {
-                if (!bus || !bus.busId) return;
-                if (!bus.lat || !bus.lng) return;
-
-                var marker = window.busMarkers[bus.busId];
-                if (marker) {
-                  marker.setLatLng([bus.lat, bus.lng]);
-                  if (bus.lastUpdate) marker._ts = bus.lastUpdate;
-                } else {
-                  var busIcon = L.divIcon({
-                    className: "bus-marker",
-                    html: '<div style="font-size:24px;">🚌</div>',
-                    iconSize: [30, 30],
-                    iconAnchor: [15, 15]
-                  });
-                  var newMarker = L.marker([bus.lat, bus.lng], { icon: busIcon, pane: 'busesPane' }).addTo(window.map);
-                  if (bus.lastUpdate) newMarker._ts = bus.lastUpdate;
-                  window.busMarkers[bus.busId] = newMarker;
+              
+              // Apply initial zoom-based visibility
+              const currentZoom = window.map.getZoom();
+              Object.values(window.__busStopMarkers).forEach(function(marker) {
+                if (currentZoom < 15 && window.map.hasLayer(marker)) {
+                  window.map.removeLayer(marker);
                 }
               });
+              
+              send(msgType + " rendered: " + added + " new, " + Object.keys(window.__busStopMarkers).length + " total");
+            } else {
+              send(msgType + " no stops to render");
+            }
+            break;
 
-              // Compute stop-bus mapping and update popups
-              computeStopBusMapping(data.buses);
-              updateStopPopups();
+          case "DRAW_ROUTE":
+            // Pure renderer: only draws what RN sends, no calculations
+            if (!window.map) {
+              send("DRAW_ROUTE failed: map not ready");
+              return;
+            }
+            
+            if (!data.coords || !Array.isArray(data.coords)) {
+              send("DRAW_ROUTE failed: no coordinates");
+              return;
+            }
+            
+            // Block straight-line artifacts (<= 2 points)
+            if (data.coords.length <= 2) {
+              send("DRAW_ROUTE blocked: too few points (straight-line artifact)");
+              return;
+            }
+            
+            // Remove previous route before drawing new
+            if (window.__routeLayer) {
+              window.map.removeLayer(window.__routeLayer);
+              window.__routeLayer = null;
+            }
+            
+            // Draw the route
+            window.__routeLayer = L.polyline(data.coords, {
+              color: '#007AFF',
+              weight: 5,
+              opacity: 0.9
+            }).addTo(window.map);
+            
+            send("DRAW_ROUTE rendered: " + data.coords.length + " points");
+            break;
 
-              // Cleanup stale markers (not in current update)
-              // Skip cleanup when data is empty to prevent markers from disappearing
-              if (data.buses.length > 0) {
-                var currentIds = {};
-                data.buses.forEach(function(b) { if (b && b.busId) currentIds[b.busId] = true; });
-                Object.keys(window.busMarkers).forEach(function(id) {
-                  if (!currentIds[id]) {
-                    if (window.map && window.map.removeLayer) {
-                      window.map.removeLayer(window.busMarkers[id]);
-                    }
-                    delete window.busMarkers[id];
-                  }
-                });
-              }
+          case "CLEAR_ROUTE":
+            send("CLEAR_ROUTE received");
+            // Remove route layer
+            if (window.__routeLayer) {
+              window.map.removeLayer(window.__routeLayer);
+              window.__routeLayer = null;
+            }
+            send("Route cleared");
+            break;
 
-              console.log("[WEBVIEW] Active buses:", Object.keys(window.busMarkers).length);
-              break;
-
-            default:
-              console.log("[WEBVIEW] Unknown type:", data.type);
-          }
-        } catch (e) {
-          console.log("[WEBVIEW] Handler error:", e.message);
-        }
-      }
-
-      // 8. ATTACH LISTENERS
-      if (!window.__BUS_LISTENER_ATTACHED__) {
-        window.__BUS_LISTENER_ATTACHED__ = true;
-        document.addEventListener("message", handleMessage);
-        window.addEventListener("message", handleMessage);
-        console.log("[WEBVIEW] Listeners attached");
-      }
-
-      // UNIFIED SET USER LOCATION (with CSS pulse - zoom independent)
-      function setUserLocation(lat, lng) {
-        if (!window.map) return;
-
-        const pos = [lat, lng];
-        window.userLocation = { lat, lng };
-
-        // Marker (create once)
-        if (!window.userMarker) {
-          window.userMarker = L.circleMarker(pos, {
-            radius: 6,
-            color: "#007AFF",
-            fillColor: "#007AFF",
-            fillOpacity: 1,
-          }).addTo(window.map);
-
-          window.userMarker.bindPopup("📍 I am here");
-        } else {
-          window.userMarker.setLatLng(pos);
-        }
-
-        // CSS Pulse marker (create once) - zoom independent divIcon
-        if (!window.userPulse) {
-          const pulseIcon = L.divIcon({
-            className: 'beacon-container',
-            html: '<div class="beacon-dot"></div><div class="beacon-pulse"></div>',
-            iconSize: [20, 20],
-            iconAnchor: [10, 10]
-          });
-          window.userPulse = L.marker(pos, { icon: pulseIcon, zIndexOffset: -100 }).addTo(window.map);
-        } else {
-          window.userPulse.setLatLng(pos);
-        }
-      }
-
-      // SINGLE POPUP GENERATOR with toggle switch
-      // NOTE: Speed removed - now shown in React Native Speedometer overlay only
-      function getBusPopup(bus) {
-        const isFollowing = window.__followBusId === bus.id;
-        const checkedAttr = isFollowing ? 'checked' : '';
-        const labelText = isFollowing ? 'Following' : 'Follow';
-        return '<div class="bus-popup">' +
-          '<div class="bus-popup-header">' + (bus.name || "Bus") + '</div>' +
-          '<label class="follow-toggle">' +
-            '<input type="checkbox" ' + checkedAttr + ' data-bus-id="' + bus.id + '">' +
-            '<span class="toggle-slider"></span>' +
-            '<span class="toggle-label">' + labelText + '</span>' +
-          '</label>' +
-        '</div>';
-      }
-
-      // UPDATE BUS POPUP (keeps popup in sync with bus data)
-      function updateBusPopup(marker, bus) {
-        if (!marker || !marker.getPopup()) return;
-        
-        // Update popup content with latest data
-        marker.setPopupContent(getBusPopup(bus));
-        
-        // If following this bus, ensure popup stays open
-        if (window.__followBusId === (bus.busId || bus.id)) {
-          if (!marker.getPopup().isOpen()) {
-            marker.openPopup();
-          }
-        }
-      }
-
-      // TOGGLE FOLLOW with optimistic UI update
-      window.toggleFollow = function(busId) {
-        // Optimistic update: toggle immediately
-        const wasFollowing = window.__followBusId === busId;
-        window.__followBusId = wasFollowing ? null : busId;
-
-        // Update popup content immediately if open
-        const marker = window.busMarkers[busId];
-        if (marker && marker.getPopup()?.isOpen() && marker.__busData) {
-          marker.setPopupContent(getBusPopup(marker.__busData));
-        }
-
-        // If unfollowing, close the popup
-        if (wasFollowing && marker) {
-          marker.closePopup();
-        }
-
-        // Send final follow state to React Native (not toggle)
-        window.ReactNativeWebView.postMessage(
-          JSON.stringify({
-            type: "SET_FOLLOW",
-            busId: window.__followBusId, // null if unfollowing, or busId if following
-          })
-        );
-      };
-
-      // RECENTER FUNCTION
-      function recenterToUser() {
-        if (!window.map || !window.userMarker) return;
-        window.__isProgrammaticMove = true;
-        const pos = window.userMarker.getLatLng();
-        window.map.flyTo(pos, 15, { duration: 0.5 });
-      }
-
-      // DRAG DETECTION - only trigger for user-initiated drags, not programmatic flyTo
-      window.__userDragging = false;
-      window.__isProgrammaticMove = false;
-
-      window.map.on("dragstart", () => {
-        // Only send FOLLOW_STOPPED if this is a user-initiated drag
-        if (!window.__isProgrammaticMove && window.__followBusId) {
-          window.__userDragging = true;
-          window.ReactNativeWebView.postMessage(
-            JSON.stringify({
-              type: "FOLLOW_STOPPED",
-              reason: "USER_DRAG",
-            })
-          );
+          default:
+            send("UNKNOWN TYPE: " + data.type);
         }
       });
+    }
+    
+    // Initialize route layer storage (pure renderer, no state)
+    window.__routeLayer = null;
+    
+    // Process queued messages - ONLY ONCE
+    if (!window.__queueProcessed) {
+      window.__queueProcessed = true;
+      processQueuedMessages();
+    }
 
-      window.map.on("moveend", () => {
-        window.__isProgrammaticMove = false;
-        setTimeout(() => {
-          window.__userDragging = false;
-        }, 100);
-      });
+    // Send MAP_READY - ALWAYS (signals RN that WebView is ready)
+    window.ReactNativeWebView?.postMessage(JSON.stringify({ type: "MAP_READY" }));
+    send("MAP READY"); // Also send log for debugging
 
-      // POPUP EVENT DELEGATION - Handle checkbox clicks safely
-      document.addEventListener('click', function(e) {
-        const checkbox = e.target.closest('.bus-popup input[type="checkbox"]');
-        if (checkbox) {
-          const busId = checkbox.getAttribute('data-bus-id');
-          if (busId) {
-            window.toggleFollow(busId);
-          }
-        }
-      });
-
-      // MAP CLICK HANDLER - Close popup only if not following
-      window.map.on("click", () => {
-        // Only close popup if not following (follow mode keeps popup open)
-        if (!window.__followBusId) {
-          window.map.closePopup();
-        }
-      });
-
-      // UPDATE BUS MARKER (no recreation)
-      window.__followBusId = null;
-      window.__userDragging = false;
-      window.__lastFlyTo = 0;
-
-      function updateBusMarker(data) {
-        if (!window.map || !data.busId) return;
-        if (!data.lat || !data.lng) return;
-
-        const busId = data.busId;
-        const lat = data.lat;
-        const lng = data.lng;
-        const speed = data.speed ?? 0;
-
-        const busData = {
-          id: busId,
-          name: data.name || busId,
-          speed: speed,
-          eta: data.eta,
-        };
-
-        if (!window.busMarkers[busId]) {
-          // CREATE NEW MARKER
-          const marker = L.marker([lat, lng]).addTo(window.map);
-
-          // Bind popup with persistent settings (autoClose: false, closeOnClick: false)
-          marker.bindPopup(getBusPopup(busData), {
-            autoClose: false,
-            closeOnClick: false
-          });
-          window.busMarkers[busId] = marker;
-        }
-
-        // Store full bus data on marker for optimistic updates
-        const marker = window.busMarkers[busId];
-        marker.__busData = busData;
-
-        // Update position
-        marker.setLatLng([lat, lng]);
-
-        // Update popup content (keeps popup in sync with moving bus)
-        updateBusPopup(marker, busData);
-
-        // CAMERA FOLLOW (throttled 1000ms for smooth following)
-        if (
-          window.__followBusId === busId &&
-          !window.__userDragging &&
-          Date.now() - window.__lastFlyTo > 1000
-        ) {
-          window.__lastFlyTo = Date.now();
-          window.__isProgrammaticMove = true;
-
-          window.map.flyTo([lat, lng], window.map.getZoom(), {
-            duration: 0.5,
-          });
-        }
-      }
-
-      // BUS_UPDATE handler (batch update)
-      window.__busUpdatePending = null;
-      function handleBusUpdate(buses) {
-        if (!Array.isArray(buses)) return;
-        buses.forEach(function(bus) {
-          if (!bus || !bus._id) return;
-          updateBusMarker({
-            busId: bus._id,
-            latitude: bus.lat ?? bus.latitude,
-            longitude: bus.lng ?? bus.longitude,
-            speed: bus.speed ?? 0,
-            name: bus.name,
-          });
-        });
-      }
-
-      console.log("[WEBVIEW] Initialization complete, waiting for map...");
-    });
+  } catch (e) {
+    send("ERROR: " + e.message);
+  }
+}); // DOMContentLoaded
   </script>
 </body>
 </html>
-  `;
+`;
 
   // Add ref for buses to resend on MAP_READY
   const busesRef = useRef(buses);
@@ -883,15 +512,74 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
     busesRef.current = buses;
   }, [buses]);
 
-  // Send toggle state to WebView when it changes
+  // Compute nearest stop, fetch OSRM, and send DRAW_ROUTE
   useEffect(() => {
     if (!webViewRef.current) return;
-    webViewRef.current.postMessage(JSON.stringify({
-      type: "TOGGLE_NEAREST_ROUTE",
-      enabled: showNearestRoute
-    }));
-    console.log("[RN] Toggle state sent to WebView:", showNearestRoute);
-  }, [showNearestRoute]);
+    
+    if (!showNearestRoute) {
+      // Clear route when disabled
+      webViewRef.current.postMessage(JSON.stringify({
+        type: "CLEAR_ROUTE"
+      }));
+      return;
+    }
+    
+    // Need user location and static stops
+    if (!userLocation || !STATIC_STOPS || STATIC_STOPS.length === 0) {
+      console.log("[RN] Cannot draw route: missing location or stops");
+      return;
+    }
+    
+    // Find nearest stop
+    let nearest = null;
+    let minDistance = Infinity;
+    
+    STATIC_STOPS.forEach(stop => {
+      const dist = Math.sqrt(
+        Math.pow(stop.lat - userLocation.latitude, 2) +
+        Math.pow(stop.lng - userLocation.longitude, 2)
+      );
+      if (dist < minDistance) {
+        minDistance = dist;
+        nearest = stop;
+      }
+    });
+    
+    if (!nearest) {
+      console.log("[RN] No nearest stop found");
+      return;
+    }
+    
+    console.log("[RN] Nearest stop:", nearest.name, "distance:", minDistance);
+    
+    // Fetch OSRM route
+    const osrmUrl = `https://router.project-osrm.org/route/v1/walking/` +
+      `${userLocation.longitude},${userLocation.latitude};` +
+      `${nearest.lng},${nearest.lat}` +
+      `?overview=full&geometries=geojson`;
+    
+    console.log("[RN] Fetching OSRM route...");
+    
+    fetch(osrmUrl)
+      .then(res => res.json())
+      .then(data => {
+        if (data.routes && data.routes.length > 0 && data.routes[0].geometry) {
+          const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+          
+          // Send DRAW_ROUTE with OSRM coordinates
+          webViewRef.current.postMessage(JSON.stringify({
+            type: "DRAW_ROUTE",
+            coords: coords
+          }));
+          console.log("[RN] DRAW_ROUTE sent with OSRM coords:", coords.length);
+        } else {
+          console.log("[RN] OSRM returned no route");
+        }
+      })
+      .catch(err => {
+        console.log("[RN] OSRM fetch error:", err.message);
+      });
+  }, [showNearestRoute, userLocation]);
 
   // Add refs for bounds debounce
   const boundsDebounceRef = useRef(null);
@@ -966,185 +654,135 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
     return merged;
   };
 
-  // Handle MAP_READY from WebView - idempotent, always resend data
+  // Handle messages from WebView - safe switch-based handler
   const handleWebViewMessage = (event) => {
+    // Debug: Log all raw messages
+    console.log("[RN MiniMap] RAW MESSAGE:", event?.nativeEvent?.data);
+
+    let data;
+
     try {
-      if (!event || !event.nativeEvent || !event.nativeEvent.data) return;
+      data = JSON.parse(event.nativeEvent.data);
+    } catch {
+      console.log("[RN MiniMap] Failed to parse message");
+      return;
+    }
 
-      var data = JSON.parse(event.nativeEvent.data);
-      if (!data || !data.type) return;
+    if (!data || !data.type) {
+      console.log("[RN MiniMap] No data or type in message");
+      return;
+    }
 
-      // Idempotent MAP_READY handling - safe for duplicates
-      if (data.type === "MAP_READY") {
-        console.log("[RN MiniMap] MAP_READY received");
+    console.log("[RN MiniMap] Parsed type:", data.type);
 
-        // Always mark as ready (idempotent)
+    switch (data.type) {
+      case "MAP_READY":
+        console.log("[RN MiniMap] MAP_READY received - sending INIT_BUS_STOPS");
         setWebViewReady(true);
-
-        // Send INIT_BUS_STOPS on MAP_READY
-        if (busStops && webViewRef.current) {
+        
+        // Send INIT_BUS_STOPS when map is ready
+        if (webViewRef.current && STATIC_STOPS?.length > 0) {
           webViewRef.current.postMessage(JSON.stringify({
             type: "INIT_BUS_STOPS",
-            stops: busStops
+            stops: STATIC_STOPS
           }));
-          console.log("[RN MiniMap] INIT_BUS_STOPS sent on MAP_READY:", busStops.length);
+          console.log("[RN MiniMap] INIT_BUS_STOPS sent:", STATIC_STOPS.length);
         }
+        break;
 
-        // Resend user location on MAP_READY (recovery mechanism)
-        if (userLocation && webViewRef.current) {
-          webViewRef.current.postMessage(JSON.stringify({
-            type: "USER_LOCATION",
-            payload: {
-              lat: userLocation.latitude,
-              lng: userLocation.longitude
-            }
-          }));
-          console.log("[RN MiniMap] USER_LOCATION resent on MAP_READY");
-        }
+      case "LOG":
+        console.log("[WEBVIEW]", data.message);
+        break;
 
-        // Resend FOLLOW_UPDATE on MAP_READY
-        if (webViewRef.current) {
-          webViewRef.current.postMessage(JSON.stringify({
-            type: "FOLLOW_UPDATE",
-            busId: followBusId
-          }));
-          console.log("[RN MiniMap] FOLLOW_UPDATE resent on MAP_READY:", followBusId);
-        }
-
-        // Resend BUS_UPDATE on MAP_READY
-        const busesArray = busesRef.current ? Object.values(busesRef.current) : [];
-        const activeBuses = busesArray.filter(bus =>
-          bus && bus.busId && bus.lat && bus.lng
-        );
-        if (activeBuses.length > 0 && webViewRef.current) {
-          webViewRef.current.postMessage(JSON.stringify({
-            type: "BUS_UPDATE",
-            buses: activeBuses
-          }));
-          console.log("[RN MiniMap] BUS_UPDATE resent on MAP_READY:", activeBuses.length);
-        }
-      }
-      
-      // PING → MAP_READY recovery (optional handshake)
-      if (data.type === "PING") {
-        console.log("[RN MiniMap] PING received, responding with PONG");
-        webViewRef.current?.postMessage(JSON.stringify({ type: "PONG" }));
-      }
-
-      // FOLLOW_STOPPED from WebView (user dragged map)
-      if (data.type === "FOLLOW_STOPPED") {
-        console.log("[RN MiniMap] FOLLOW_STOPPED from WebView");
-        setFollowBusId(null);
-        return;
-      }
-
-      // SET_FOLLOW from WebView (popup toggle - final state)
-      if (data.type === "SET_FOLLOW") {
-        console.log("[RN MiniMap] SET_FOLLOW from WebView:", data.busId);
+      case "SET_FOLLOW":
+        console.log("[RN MiniMap] SET_FOLLOW:", data.busId);
         setFollowBusId(data.busId || null);
-        return;
-      }
+        break;
 
-      // MAP_BOUNDS from WebView (viewport changed)
-      if (data.type === "MAP_BOUNDS" && data.bounds) {
-        // Debounce to prevent rapid API calls
-        clearTimeout(boundsDebounceRef.current);
-
-        // Check if bounds changed significantly
-        const bounds = data.bounds;
-        const lastBounds = lastBoundsRef.current;
-        const boundsChanged = !lastBounds ||
-          Math.abs(lastBounds.minLat - bounds.minLat) > 0.01 ||
-          Math.abs(lastBounds.maxLat - bounds.maxLat) > 0.01 ||
-          Math.abs(lastBounds.minLng - bounds.minLng) > 0.01 ||
-          Math.abs(lastBounds.maxLng - bounds.maxLng) > 0.01;
-
-        if (boundsChanged) {
-          lastBoundsRef.current = bounds;
-          boundsDebounceRef.current = setTimeout(() => {
-            fetchStopsWithBounds(bounds);
-          }, 500); // 500ms debounce
-        }
-        return;
-      }
-    } catch (e) {
-      console.log("[MiniMap] Invalid message:", event?.nativeEvent?.data, e.message);
+      default:
+        console.log("[RN MiniMap] Unknown message type:", data.type);
     }
   };
 
+  // Fallback: Send INIT_BUS_STOPS after delay if MAP_READY wasn't received
+  useEffect(() => {
+    if (!webViewRef.current) return;
+
+    const timer = setTimeout(() => {
+      if (webViewRef.current && STATIC_STOPS?.length > 0) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "INIT_BUS_STOPS",
+          stops: STATIC_STOPS
+        }));
+        console.log("[RN MiniMap] FALLBACK INIT_BUS_STOPS sent:", STATIC_STOPS.length);
+      }
+    }, 1500);
+
+    return () => clearTimeout(timer);
+  }, []);
+
   return (
-    <View style={{ flex: 1 }}>
-      <WebView
-        ref={webViewRef}
-        source={{ html: mapHTML }}
-        onMessage={handleWebViewMessage}
-        javaScriptEnabled={true}
-        domStorageEnabled={true}
-        originWhitelist={["*"]}
-        scrollEnabled={false}
-        style={{ width: '100%', height: 200 }}
-      />
-      {/* Zoom Controls */}
-      <View style={styles.zoomControls}>
+    <View>
+      <View style={{ height: 200 }}>
+        <WebView
+          ref={webViewRef}
+          originWhitelist={['*']}
+          javaScriptEnabled
+          domStorageEnabled
+          mixedContentMode="always"
+          allowFileAccess
+          allowUniversalAccessFromFileURLs
+          allowFileAccessFromFileURLs
+          androidLayerType="hardware"
+          onMessage={handleWebViewMessage}
+          source={{ html: mapHTML }}
+          style={{ flex: 1 }}
+        />
+      </View>
+      {/* Action Buttons Below Map */}
+      <View style={{ flexDirection: 'row', paddingHorizontal: 12, paddingVertical: 8, gap: 8 }}>
         <TouchableOpacity
-          style={styles.zoomButton}
-          onPress={() => webViewRef.current?.postMessage(JSON.stringify({ type: "ZOOM_IN" }))}
+          style={[styles.actionButton, { flex: 1 }]}
+          onPress={() => {
+            console.log("[RN] RECENTER pressed");
+            console.log("WebView ref:", webViewRef.current);
+            webViewRef.current?.postMessage(JSON.stringify({ type: "RECENTER" }));
+          }}
         >
-          <Text style={styles.zoomText}>+</Text>
+          <Text style={styles.actionButtonText}>⌖</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={styles.zoomButton}
-          onPress={() => webViewRef.current?.postMessage(JSON.stringify({ type: "ZOOM_OUT" }))}
+          style={[styles.actionButton, { flex: 2 }]}
+          onPress={onPress}
         >
-          <Text style={styles.zoomText}>−</Text>
+          <Text style={styles.actionButtonText}>Full Map</Text>
         </TouchableOpacity>
       </View>
-      {/* Recenter Button */}
+      {/* Nearest Route Toggle Button */}
       <TouchableOpacity
-        style={[styles.zoomButton, { position: 'absolute', bottom: 10, left: 10, backgroundColor: '#007AFF' }]}
-        onPress={() => webViewRef.current?.postMessage(JSON.stringify({ type: "RECENTER" }))}
-      >
-        <Text style={{ color: 'white', fontSize: 18 }}>⌖</Text>
-      </TouchableOpacity>
-      {/* Full Map Button */}
-      <TouchableOpacity style={styles.fullMapButton} onPress={onPress}>
-        <Text style={styles.fullMapText}>Full Map</Text>
-      </TouchableOpacity>
-      {/* Nearest Route Toggle Button - Bottom Overlay */}
-      <View
-        pointerEvents="box-none"
+        onPress={() => {
+          setShowNearestRoute(prev => {
+            const newValue = !prev;
+            console.log("[RN] Toggle:", newValue);
+            return newValue;
+          });
+        }}
         style={{
-          position: 'absolute',
-          bottom: 20,
-          left: 20,
-          right: 20,
-          zIndex: 999,
-          elevation: 10
+          backgroundColor: '#007AFF',
+          paddingVertical: 14,
+          marginHorizontal: 12,
+          marginBottom: 12,
+          borderRadius: 10,
+          alignItems: 'center',
         }}
       >
-        <TouchableOpacity
-          onPress={() => {
-            setShowNearestRoute(prev => {
-              const newValue = !prev;
-              console.log("[RN] Toggle:", newValue);
-              return newValue;
-            });
-          }}
-          style={{
-            backgroundColor: '#007AFF',
-            paddingVertical: 14,
-            borderRadius: 14,
-            alignItems: 'center'
-          }}
-        >
-          <Text style={{ color: '#fff', fontWeight: '600' }}>
-            {showNearestRoute ? "Hide Nearest Stop" : "Show Nearest Stop"}
-          </Text>
-        </TouchableOpacity>
-      </View>
+        <Text style={{ color: 'white', fontSize: 16, fontWeight: '600' }}>
+          {showNearestRoute ? 'Hide Route' : 'Show Route'}
+        </Text>
+      </TouchableOpacity>
     </View>
   );
-};
+}, () => true);
 
 const HomeScreen = () => {
   const navigation = useNavigation();
@@ -1166,6 +804,7 @@ const HomeScreen = () => {
   const lastUserLocationRef = useRef(null); // Cache for resend on WebView load
   const busStopsRef = useRef(null); // Cache bus stops for resend
   const [webViewReady, setWebViewReady] = useState(false);
+  const hasMapInitialized = useRef(false);
 
   // Track alerted SOS buses to prevent duplicate alerts
   const alertedSOS = useRef(new Set());
@@ -1183,10 +822,8 @@ const HomeScreen = () => {
     // Send to MiniMap WebView
     const msg = {
       type: "USER_LOCATION",
-      payload: {
-        lat: userLocation.latitude,
-        lng: userLocation.longitude
-      }
+      lat: userLocation.latitude,
+      lng: userLocation.longitude
     };
 
     if (webViewRef.current) {
@@ -1262,6 +899,9 @@ const HomeScreen = () => {
     // Primary send
     webViewRef.current.postMessage(payload);
     console.log("[RN] postMessage called for BUS_UPDATE");
+    activeBuses.forEach(function(bus) {
+      console.log("[RN → MiniMap BUS_UPDATE]", bus.busId, bus.lat, bus.lng);
+    });
 
     // Clear previous retry (prevents stacking under rapid updates)
     if (retryTimeoutRef.current) {
@@ -1346,16 +986,14 @@ const HomeScreen = () => {
     fetchBusStops();
   }, []); // Fetch only once on mount
   
-  // Send bus stops when WebView becomes ready (if already fetched)
+  // Sync busStopsRef with prop when it changes (from useBus hook)
   useEffect(() => {
-    if (webViewReady && webViewRef.current && busStopsRef.current) {
-      webViewRef.current.postMessage(JSON.stringify({
-        type: "INIT_BUS_STOPS",
-        stops: busStopsRef.current
-      }));
+    if (busStops && busStops.length > 0) {
+      busStopsRef.current = busStops;
+      console.log("[RN MiniMap] busStopsRef updated:", busStops.length);
     }
-  }, [webViewReady]);
-
+  }, [busStops]);
+  
   // Fetch user location
   useEffect(() => {
     (async () => {
@@ -1607,6 +1245,25 @@ const styles = StyleSheet.create({
     top: 8,
     flexDirection: "column",
     gap: 4,
+  },
+
+  actionButton: {
+    backgroundColor: "white",
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
+    elevation: 3,
+  },
+
+  actionButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#333",
   },
 
   zoomButton: {

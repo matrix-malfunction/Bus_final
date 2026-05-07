@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: red; }
+    #map { width: 100%; height: 100%; background: blue; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    console.log("[WEBVIEW] Script loaded");
+    console.log("[WEBVIEW] typeof L:", typeof L);
+
+    window.onerror = function(message, source, lineno, colno, error) {
+      console.log("[WEBVIEW ERROR]", message, "at line", lineno, ":", source);
+      return false;
+    };
+
+    function initMap() {
+      // Guard: prevent duplicate map initialization
+      if (window.map) {
+        console.log("[WEBVIEW] Map already exists, skipping");
+        return;
+      }
+
+      if (typeof L === "undefined") {
+        console.log("[WEBVIEW] Leaflet not ready, retrying...");
+        setTimeout(initMap, 100);
+        return;
+      }
+
+      console.log("[WEBVIEW] Leaflet ready");
+
+      try {
+        console.log("[WEBVIEW] Creating map...");
+        var map = L.map("map", {
+          zoomControl: false,
+          attributionControl: false
+        }).setView([13.0827, 80.2707], 13);
+        window.map = map;
+
+        console.log("[WEBVIEW] Adding tile layer...");
+        var tileLayer = L.tileLayer("https://a.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          crossOrigin: true
+        }).addTo(map);
+
+        tileLayer.on("tileerror", function(error) {
+          console.log("[WEBVIEW] Tile error:", error);
+        });
+
+        console.log("[WEBVIEW] Map initialized successfully");
+
+        // Notify React Native
+        if (window.ReactNativeWebView) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: "MAP_READY" }));
+        }
+
+      } catch (e) {
+        console.log("[WEBVIEW ERROR]", e);
+      }
+    }
+
+    // Start initialization
+    initMap();
+  </script>
+</body>
+</html>
