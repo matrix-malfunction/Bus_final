@@ -3,13 +3,36 @@ import io from "socket.io-client";
 
 const API_BASE_URL = "https://bus-tracking-backend-6htm.onrender.com";
 
+// Static bus stops (exact coordinates)
+const STATIC_STOPS = [
+  { id: "vellore_1", name: "Vellore New Bus Station", lat: 12.9346, lng: 79.1366 },
+  { id: "vellore_2", name: "Vellore Old Bus Stand", lat: 12.9223, lng: 79.1325 },
+  { id: "vellore_3", name: "Vellore Smart City New Bus Stand", lat: 12.9347, lng: 79.1376 },
+  { id: "vellore_4", name: "Jubilee Gate Bus Stop (CMC)", lat: 12.9245, lng: 79.1376 },
+  { id: "vellore_5", name: "Vallalar Bus Stop", lat: 12.9383, lng: 79.1669 },
+  { id: "vellore_6", name: "New Bus Stand (Thottapalayam)", lat: 12.9244, lng: 79.1273 },
+  { id: "vellore_7", name: "Vellore TNSTC Bus Depot", lat: 12.9245, lng: 79.1149 },
+  { id: "vellore_8", name: "Sainathapuram Bus Stop", lat: 12.8970, lng: 79.1352 },
+  { id: "vellore_9", name: "Katpadi Bus Stand", lat: 12.9672, lng: 79.1374 },
+  { id: "tvlr_1", name: "Thiruvallur Bus Stand", lat: 13.1386, lng: 79.9076 },
+  { id: "tvlr_2", name: "Thiruvallur Terminal", lat: 13.1405, lng: 79.9080 },
+  { id: "tvlr_3", name: "Thiruvallur Oil Mill Bus Stop", lat: 13.1227, lng: 79.9118 },
+  { id: "tvlr_4", name: "Theradi Bus Stop", lat: 13.1433, lng: 79.9088 },
+  { id: "tvlr_5", name: "Thiruvallur Court Bus Stop", lat: 13.1370, lng: 79.9176 },
+  { id: "tvlr_6", name: "Thiruvallur Bustand (Kakkalur)", lat: 13.1227, lng: 79.9118 },
+  { id: "tvlr_7", name: "Manavalanagar Bus Stop", lat: 13.1126, lng: 79.9133 },
+  { id: "tvlr_8", name: "Ondikuppam Bus Stop", lat: 13.1104, lng: 79.9180 },
+  { id: "tvlr_9", name: "SBI Bus Stop (JN Road)", lat: 13.1354, lng: 79.9087 }
+];
+
 export const BusContext = createContext({
   buses: {},
   sosAlerts: [],
   userLocation: null,
   socket: null,
   followBusId: null,
-  setFollowBusId: () => {}
+  setFollowBusId: () => {},
+  busStops: STATIC_STOPS
 });
 
 export const useBus = () => useContext(BusContext);
@@ -80,7 +103,8 @@ export function BusProvider({ children }) {
     followBusId,
     setFollowBusId,
     userLocation,
-    setUserLocation
+    setUserLocation,
+    busStops: STATIC_STOPS
   };
 
   return <BusContext.Provider value={value}>{children}</BusContext.Provider>;

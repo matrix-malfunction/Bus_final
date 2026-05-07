@@ -35,7 +35,7 @@ const BusStopCard = ({ stopName, distance, nextBusTime, onPress }) => (
 );
 
 // Mini Map Component - VIEW ONLY
-const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, followBusId, setFollowBusId }) => {
+const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, followBusId, setFollowBusId, busStops, showNearestRoute, setShowNearestRoute }) => {
   const mapHTML = `
 <!DOCTYPE html>
 <html>
@@ -95,6 +95,51 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
     .follow-toggle input:checked + .toggle-slider { background: #007AFF; }
     .follow-toggle input:checked + .toggle-slider::after { left: 22px; }
     .toggle-label { font-size: 12px; color: #333; }
+
+    /* Modern Bus Stop Marker */
+    .bus-stop-marker {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .bus-stop-icon {
+      width: 28px;
+      height: 28px;
+      background: white;
+      border: 2px solid #333;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+      font-size: 14px;
+    }
+    .bus-stop-label {
+      background: white;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      margin-top: 4px;
+      white-space: nowrap;
+      max-width: 80px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+      color: #333;
+    }
+    .bus-stop-highlighted {
+      background: #007AFF;
+      border-color: #0051D5;
+      width: 36px;
+      height: 36px;
+      font-size: 18px;
+      box-shadow: 0 4px 12px rgba(0,122,255,0.4);
+    }
+    .bus-stop-highlighted-label {
+      background: #007AFF;
+      color: white;
+    }
   </style>
 </head>
 <body>
@@ -146,11 +191,245 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
       window.busMarkers = {};
       window.userMarker = null;
       window.userPulse = null;
-      window.followBusId = null;
-      window.userLocation = null;
-      window._lastFollow = 0;
-      window.__pulseRadius = 0;
-      window.__pulseInterval = null;
+      window.__busStops = [];
+      window.__busStopMarkers = {};
+      window.__stopBusMap = {}; // stopId → [busIds]
+      window.__highlightedStopId = null; // Currently highlighted stop
+      window.__lastNearestDistance = Infinity; // For hysteresis
+      window.__nearestRouteLayer = null; // Polyline for nearest stop route
+      window.__showNearestRoute = false; // Route toggle state
+
+      // Bus stop icon
+      function createStopIcon(name) {
+        return L.divIcon({
+          html: '<div class="bus-stop-marker">' +
+            '<div class="bus-stop-icon">🛑</div>' +
+            '<div class="bus-stop-label">' + (name || 'Stop') + '</div>' +
+            '</div>',
+          className: '',
+          iconSize: [80, 60],
+          iconAnchor: [40, 60]
+        });
+      }
+
+      // Haversine distance in meters
+      function haversine(lat1, lng1, lat2, lng2) {
+        const R = 6371000;
+        const φ1 = lat1 * Math.PI / 180;
+        const φ2 = lat2 * Math.PI / 180;
+        const Δφ = (lat2 - lat1) * Math.PI / 180;
+        const Δλ = (lng2 - lng1) * Math.PI / 180;
+        const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                  Math.cos(φ1) * Math.cos(φ2) *
+                  Math.sin(Δλ/2) * Math.sin(Δλ/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return R * c;
+      }
+
+      // Compute nearest stop for each bus (50m threshold)
+      function computeStopBusMapping(buses) {
+        if (!buses || !window.__busStops) return;
+
+        // Reset mapping
+        window.__stopBusMap = {};
+
+        buses.forEach(function(bus) {
+          if (!bus || !bus.lat || !bus.lng || !bus.busId) return;
+
+          let nearestStop = null;
+          let minDistance = Infinity;
+
+          window.__busStops.forEach(function(stop) {
+            if (!stop.id || !stop.lat || !stop.lng) return;
+
+            const distance = haversine(bus.lat, bus.lng, stop.lat, stop.lng);
+
+            if (distance < minDistance && distance < 50) { // 50m threshold
+              minDistance = distance;
+              nearestStop = stop;
+            }
+          });
+
+          if (nearestStop) {
+            if (!window.__stopBusMap[nearestStop.id]) {
+              window.__stopBusMap[nearestStop.id] = [];
+            }
+            window.__stopBusMap[nearestStop.id].push(bus.busId);
+          }
+        });
+      }
+
+      // Update stop popup with buses
+      function updateStopPopups() {
+        Object.keys(window.__busStopMarkers).forEach(function(stopId) {
+          const marker = window.__busStopMarkers[stopId];
+          if (!marker) return;
+
+          const busIds = window.__stopBusMap[stopId] || [];
+          const stopName = marker.__stopName || 'Bus Stop';
+
+          let content = '<b>' + stopName + '</b><br>';
+
+          if (busIds.length > 0) {
+            content += '<span style="font-size:12px;color:#666;">Buses: ' + busIds.length + '</span>';
+          } else {
+            content += '<span style="font-size:12px;color:#999;">No buses nearby</span>';
+          }
+
+          if (marker.getPopup()) {
+            marker.setPopupContent(content);
+          }
+        });
+      }
+
+      // Highlight nearest stop to user
+      function highlightNearestStop(userLat, userLng) {
+        if (!window.__busStops || !window.__busStops.length) return;
+
+        let nearestStop = null;
+        let minDistance = Infinity;
+
+        window.__busStops.forEach(function(stop) {
+          if (!stop.id || !stop.lat || !stop.lng) return;
+
+          const distance = haversine(userLat, userLng, stop.lat, stop.lng);
+
+          if (distance < minDistance && distance < 500) { // 500m threshold
+            minDistance = distance;
+            nearestStop = stop;
+          }
+        });
+
+        // Hysteresis: only change if distance changed by >20m
+        if (nearestStop) {
+          const distanceChange = Math.abs(minDistance - window.__lastNearestDistance);
+
+          if (nearestStop.id !== window.__highlightedStopId && distanceChange > 20) {
+            // Reset previous highlight
+            if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
+              const prevMarker = window.__busStopMarkers[window.__highlightedStopId];
+              const prevStopName = prevMarker.__stopName || 'Stop';
+              prevMarker.setIcon(createStopIcon(prevStopName));
+            }
+
+            // Highlight new stop
+            if (window.__busStopMarkers[nearestStop.id]) {
+              const marker = window.__busStopMarkers[nearestStop.id];
+              marker.setIcon(L.divIcon({
+                html: '<div class="bus-stop-marker">' +
+                  '<div class="bus-stop-icon bus-stop-highlighted">🛑</div>' +
+                  '<div class="bus-stop-label bus-stop-highlighted-label">' + nearestStop.name + '</div>' +
+                  '</div>',
+                className: '',
+                iconSize: [80, 60],
+                iconAnchor: [40, 60]
+              }));
+            }
+
+            window.__highlightedStopId = nearestStop.id;
+            window.__lastNearestDistance = minDistance;
+            console.log("[WEBVIEW] Highlighted nearest stop:", nearestStop.name, "Distance:", minDistance.toFixed(0) + "m");
+          }
+        } else {
+          // Reset highlight if no stop within 500m
+          if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
+            const prevMarker = window.__busStopMarkers[window.__highlightedStopId];
+            const prevStopName = prevMarker.__stopName || 'Stop';
+            prevMarker.setIcon(createStopIcon(prevStopName));
+            window.__highlightedStopId = null;
+            window.__lastNearestDistance = Infinity;
+          }
+        }
+      }
+
+      // Update nearest route polyline
+      function updateNearestRoute(lat, lng) {
+        if (!window.map) return;
+
+        if (!window.__busStops || window.__busStops.length === 0) {
+          console.log("[WEBVIEW] No bus stops available");
+          return;
+        }
+
+        let nearest = null;
+        let minDist = Infinity;
+
+        window.__busStops.forEach(stop => {
+          if (!stop.lat || !stop.lng) return;
+
+          const d = Math.sqrt(
+            Math.pow(stop.lat - lat, 2) +
+            Math.pow(stop.lng - lng, 2)
+          );
+
+          if (d < minDist) {
+            minDist = d;
+            nearest = stop;
+          }
+        });
+
+        if (!nearest) {
+          console.log("[WEBVIEW] No nearest stop found");
+          return;
+        }
+
+        console.log("[WEBVIEW] Nearest stop:", nearest.name);
+
+        if (window.__nearestRouteLayer) {
+          window.map.removeLayer(window.__nearestRouteLayer);
+        }
+
+        window.__nearestRouteLayer = L.polyline(
+          [[lat, lng], [nearest.lat, nearest.lng]],
+          {
+            color: '#007AFF',
+            weight: 4,
+            dashArray: '8, 8'
+          }
+        ).addTo(window.map);
+      }
+
+      // Render bus stops
+      function renderBusStops() {
+        if (!window.map || !window.__busStops) return;
+
+        const zoom = window.map.getZoom();
+
+        if (zoom < 14) {
+          Object.values(window.__busStopMarkers).forEach(m => {
+            if (window.map.hasLayer(m)) window.map.removeLayer(m);
+          });
+          return;
+        }
+
+        window.__busStops.forEach(stop => {
+          if (!stop.id || !stop.lat || !stop.lng) return;
+
+          let marker = window.__busStopMarkers[stop.id];
+
+          if (!marker) {
+            marker = L.marker([stop.lat, stop.lng], {
+              icon: createStopIcon(stop.name),
+              pane: 'busStopsPane'
+            }).addTo(window.map);
+
+            marker.__stopName = stop.name;
+            marker.bindPopup(
+              '<b>' + stop.name + '</b><br><span style="font-size:12px;color:#999;">Loading...</span>'
+            );
+
+            window.__busStopMarkers[stop.id] = marker;
+          } else {
+            marker.setLatLng([stop.lat, stop.lng]);
+            if (!window.map.hasLayer(marker)) marker.addTo(window.map);
+          }
+        });
+      }
+
+      // Zoom handler
+      window.map.on("zoomend", function() {
+        renderBusStops();
+      });
 
       // 4. MAP READY HANDLER
       function sendMapReady() {
@@ -213,6 +492,39 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
               const lng = data.payload?.lng;
               if (lat != null && lng != null) {
                 setUserLocation(Number(lat), Number(lng));
+                highlightNearestStop(Number(lat), Number(lng));
+                
+                // Store user location for route drawing
+                window.__lastUserLocation = {
+                  lat: Number(lat),
+                  lng: Number(lng)
+                };
+                
+                if (window.__showNearestRoute) {
+                  updateNearestRoute(Number(lat), Number(lng));
+                }
+              }
+              break;
+
+            case "TOGGLE_NEAREST_ROUTE":
+              window.__showNearestRoute = data.enabled;
+              console.log("[WEBVIEW] Toggle:", window.__showNearestRoute);
+              console.log("[WEBVIEW] Stops:", window.__busStops?.length);
+              console.log("[WEBVIEW] Last location:", window.__lastUserLocation);
+              
+              if (!data.enabled) {
+                if (window.__nearestRouteLayer) {
+                  window.map.removeLayer(window.__nearestRouteLayer);
+                  window.__nearestRouteLayer = null;
+                }
+              } else {
+                // CRITICAL: draw immediately using last location
+                if (window.__lastUserLocation) {
+                  updateNearestRoute(
+                    window.__lastUserLocation.lat,
+                    window.__lastUserLocation.lng
+                  );
+                }
               }
               break;
 
@@ -242,158 +554,15 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
                 console.log("[WEBVIEW] Invalid INIT_BUS_STOPS");
                 return;
               }
-              // Store bus stops
               window.__busStops = data.stops;
-              
-              // Check if map is ready
-              if (!window.map) {
-                console.log("[WEBVIEW] Map not ready, queuing bus stops");
-                window.__pendingBusStopRender = true;
-                return;
+
+              if (window.map) {
+                renderBusStops();
+              } else {
+                setTimeout(function() {
+                  if (window.map) renderBusStops();
+                }, 300);
               }
-              
-              // Create LayerGroup if not exists (in busStopsPane)
-              if (!window.busStopLayer) {
-                window.busStopLayer = L.layerGroup({ pane: 'busStopsPane' });
-                window.__busStopZoomBucket = null;
-                window.__busStopInitialized = false;
-                window.__busStopMarkers = {}; // Cache individual markers
-              }
-              
-              // Reset for fresh render on INIT
-              window.__busStopZoomBucket = null;
-              window.__busStopInitialized = false;
-              
-              // Bus stop icon (lightweight small circle)
-              function createStopIcon(name) {
-                return L.divIcon({
-                  html: '<div style="width:12px;height:12px;background:#e74c3c;border:2px solid white;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,0.3);"></div>',
-                  className: 'bus-stop-marker',
-                  iconSize: [12, 12],
-                  iconAnchor: [6, 6]
-                });
-              }
-
-              // Create popup for bus stop
-              function createStopPopup(stop) {
-                return '<b>' + (stop.name || 'Bus Stop') + '</b><br>' +
-                  '<div style="margin-top:8px;font-size:12px;color:#666;">Buses at this stop:</div>' +
-                  '<div style="margin-top:4px;font-size:11px;color:#999;">Loading...</div>';
-              }
-
-              // Get zoom bucket category
-              function getZoomBucket(zoom) {
-                if (zoom < 14) return "none";
-                return "all";
-              }
-              
-              // Render function with zoom-based filtering (optimized)
-              function renderBusStops() {
-                if (!window.map || !window.__busStops.length) return;
-
-                const zoom = window.map.getZoom();
-                const bucket = getZoomBucket(zoom);
-
-                // Skip render if bucket hasn't changed (but always render first time)
-                if (bucket === window.__busStopZoomBucket && window.__busStopInitialized) return;
-
-                // Update bucket
-                window.__busStopZoomBucket = bucket;
-
-                // zoom < 14: hide all stops
-                if (bucket === "none") {
-                  window.map.removeLayer(window.busStopLayer);
-                  return;
-                }
-
-                // Show all stops at zoom >= 14
-                const stopsToShow = window.__busStops;
-
-                // Build set of visible stop IDs
-                const visibleIds = {};
-                stopsToShow.forEach(function(stop) {
-                  if (!stop || !stop.id) return;
-                  visibleIds[stop.id] = true;
-                });
-
-                // Hide markers not in current zoom bucket
-                Object.keys(window.__busStopMarkers).forEach(function(stopId) {
-                  if (!visibleIds[stopId]) {
-                    window.busStopLayer.removeLayer(window.__busStopMarkers[stopId]);
-                  }
-                });
-
-                // Show/create markers for visible stops
-                stopsToShow.forEach(function(stop) {
-                  if (!stop || !stop.id || !stop.lat || !stop.lng) return;
-
-                  if (window.__busStopMarkers[stop.id]) {
-                    // Marker exists, just show it
-                    window.busStopLayer.addLayer(window.__busStopMarkers[stop.id]);
-                  } else {
-                    // Create new marker and cache it
-                    const marker = L.marker([stop.lat, stop.lng], {
-                      icon: createStopIcon(stop.name),
-                      pane: 'busStopsPane'
-                    }).bindPopup(createStopPopup(stop), {
-                      pane: 'busStopsPopupPane',
-                      autoClose: true,
-                      closeOnClick: true
-                    });
-                    window.__busStopMarkers[stop.id] = marker;
-                    window.busStopLayer.addLayer(marker);
-                  }
-                });
-
-                // Show layer (only add if not already on map)
-                if (!window.map.hasLayer(window.busStopLayer)) {
-                  window.map.addLayer(window.busStopLayer);
-                }
-
-                // Mark as initialized after first render
-                window.__busStopInitialized = true;
-              }
-              
-              // Update on zoom change
-              window.map.off('zoomend', renderBusStops);
-              window.map.on('zoomend', renderBusStops);
-
-              // Track viewport bounds for dynamic stop loading
-              window.__lastBounds = null;
-              window.__boundsDebounce = null;
-
-              window.map.on('moveend', function() {
-                const bounds = map.getBounds();
-                const currentBounds = {
-                  minLat: bounds.getSouth(),
-                  maxLat: bounds.getNorth(),
-                  minLng: bounds.getWest(),
-                  maxLng: bounds.getEast()
-                };
-
-                // Debounce and check if bounds actually changed
-                clearTimeout(window.__boundsDebounce);
-                window.__boundsDebounce = setTimeout(function() {
-                  // Only send if bounds changed significantly
-                  if (!window.__lastBounds ||
-                    Math.abs(window.__lastBounds.minLat - currentBounds.minLat) > 0.01 ||
-                    Math.abs(window.__lastBounds.maxLat - currentBounds.maxLat) > 0.01 ||
-                    Math.abs(window.__lastBounds.minLng - currentBounds.minLng) > 0.01 ||
-                    Math.abs(window.__lastBounds.maxLng - currentBounds.maxLng) > 0.01) {
-                    window.__lastBounds = currentBounds;
-                    window.ReactNativeWebView.postMessage(JSON.stringify({
-                      type: "MAP_BOUNDS",
-                      bounds: currentBounds
-                    }));
-                    console.log("[WEBVIEW] Sent MAP_BOUNDS:", currentBounds);
-                  }
-                }, 500); // 500ms debounce
-              });
-
-              // Initial render (will always run due to initialized = false)
-              renderBusStops();
-              
-              console.log("[WEBVIEW] Bus stops loaded:", data.stops.length);
               break;
 
             case "BUS_OFFLINE":
@@ -443,6 +612,10 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
                   window.busMarkers[bus.busId] = newMarker;
                 }
               });
+
+              // Compute stop-bus mapping and update popups
+              computeStopBusMapping(data.buses);
+              updateStopPopups();
 
               // Cleanup stale markers (not in current update)
               // Skip cleanup when data is empty to prevent markers from disappearing
@@ -710,6 +883,16 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
     busesRef.current = buses;
   }, [buses]);
 
+  // Send toggle state to WebView when it changes
+  useEffect(() => {
+    if (!webViewRef.current) return;
+    webViewRef.current.postMessage(JSON.stringify({
+      type: "TOGGLE_NEAREST_ROUTE",
+      enabled: showNearestRoute
+    }));
+    console.log("[RN] Toggle state sent to WebView:", showNearestRoute);
+  }, [showNearestRoute]);
+
   // Add refs for bounds debounce
   const boundsDebounceRef = useRef(null);
   const lastBoundsRef = useRef(null);
@@ -794,9 +977,18 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
       // Idempotent MAP_READY handling - safe for duplicates
       if (data.type === "MAP_READY") {
         console.log("[RN MiniMap] MAP_READY received");
-        
+
         // Always mark as ready (idempotent)
         setWebViewReady(true);
+
+        // Send INIT_BUS_STOPS on MAP_READY
+        if (busStops && webViewRef.current) {
+          webViewRef.current.postMessage(JSON.stringify({
+            type: "INIT_BUS_STOPS",
+            stops: busStops
+          }));
+          console.log("[RN MiniMap] INIT_BUS_STOPS sent on MAP_READY:", busStops.length);
+        }
 
         // Resend user location on MAP_READY (recovery mechanism)
         if (userLocation && webViewRef.current) {
@@ -881,7 +1073,7 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
   };
 
   return (
-    <View style={styles.mapContainer}>
+    <View style={{ flex: 1 }}>
       <WebView
         ref={webViewRef}
         source={{ html: mapHTML }}
@@ -918,6 +1110,38 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, fo
       <TouchableOpacity style={styles.fullMapButton} onPress={onPress}>
         <Text style={styles.fullMapText}>Full Map</Text>
       </TouchableOpacity>
+      {/* Nearest Route Toggle Button - Bottom Overlay */}
+      <View
+        pointerEvents="box-none"
+        style={{
+          position: 'absolute',
+          bottom: 20,
+          left: 20,
+          right: 20,
+          zIndex: 999,
+          elevation: 10
+        }}
+      >
+        <TouchableOpacity
+          onPress={() => {
+            setShowNearestRoute(prev => {
+              const newValue = !prev;
+              console.log("[RN] Toggle:", newValue);
+              return newValue;
+            });
+          }}
+          style={{
+            backgroundColor: '#007AFF',
+            paddingVertical: 14,
+            borderRadius: 14,
+            alignItems: 'center'
+          }}
+        >
+          <Text style={{ color: '#fff', fontWeight: '600' }}>
+            {showNearestRoute ? "Hide Nearest Stop" : "Show Nearest Stop"}
+          </Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 };
@@ -926,7 +1150,8 @@ const HomeScreen = () => {
   const navigation = useNavigation();
   const [searchQuery, setSearchQuery] = useState("");
   const [userLocation, setUserLocation] = useState(DEFAULT_CENTER);
-  const { buses, socket } = useBus();
+  const [showNearestRoute, setShowNearestRoute] = useState(false);
+  const { buses, socket, busStops } = useBus();
   
   // Local follow state (single source of truth for this screen)
   const [followBusId, setFollowBusId] = useState(null);
@@ -1246,6 +1471,9 @@ const HomeScreen = () => {
             userLocation={userLocation}
             followBusId={followBusId}
             setFollowBusId={setFollowBusId}
+            busStops={busStops}
+            showNearestRoute={showNearestRoute}
+            setShowNearestRoute={setShowNearestRoute}
           />
         </View>
       </ScrollView>
