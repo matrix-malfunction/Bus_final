@@ -14,6 +14,7 @@ import * as Location from "expo-location";
 import { useNavigation } from "@react-navigation/native";
 import { fetchNearbyBuses, expandBusData } from "./api/busApi";
 import { useBus } from "./BusContext";
+import Speedometer from "./components/Speedometer";
 
 const API_BASE_URL = "https://bus-tracking-backend-6htm.onrender.com";
 const DEFAULT_CENTER = { latitude: 13.1044, longitude: 79.9079 };
@@ -34,7 +35,7 @@ const BusStopCard = ({ stopName, distance, nextBusTime, onPress }) => (
 );
 
 // Mini Map Component - VIEW ONLY
-const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) => {
+const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation, followBusId, setFollowBusId }) => {
   const mapHTML = `
 <!DOCTYPE html>
 <html>
@@ -104,19 +105,44 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
     document.addEventListener("DOMContentLoaded", function() {
       console.log("[WEBVIEW] DOMContentLoaded - Initializing map...");
 
-      // 1. CREATE MAP FIRST (zoomControl disabled, use RN buttons only)
-      var map = L.map('map', { zoomControl: false }).setView([13.0827, 80.2707], 13);
+      // 1. CREATE MAP FIRST (all default controls disabled)
+      var map = L.map('map', {
+        zoomControl: false,
+        attributionControl: false
+      }).setView([13.0827, 80.2707], 13);
       window.map = map; // Expose globally
 
-      // 2. ADD TILE LAYER
+      // 2. REMOVE ANY INJECTED LAYER CONTROLS (safeguard)
+      setTimeout(function() {
+        document.querySelectorAll('.leaflet-control-layers').forEach(function(el) { el.remove(); });
+        document.querySelectorAll('.leaflet-control-attribution').forEach(function(el) { el.remove(); });
+      }, 0);
+
+      // 3. ADD TILE LAYER
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19
       }).addTo(map);
 
-      // 3. CREATE GLOBALS AFTER MAP EXISTS
+      // 3a. CREATE PANES FOR PROPER Z-ORDERING
+      // Bus stops below buses for clean layering
+      map.createPane('busStopsPane');
+      map.getPane('busStopsPane').style.zIndex = 400;
+      
+      map.createPane('busesPane');
+      map.getPane('busesPane').style.zIndex = 500;
+      
+      // Popup panes (above markers)
+      map.createPane('busStopsPopupPane');
+      map.getPane('busStopsPopupPane').style.zIndex = 600;
+      
+      map.createPane('busPopupPane');
+      map.getPane('busPopupPane').style.zIndex = 650;
+
+      // 3b. CREATE GLOBALS AFTER MAP EXISTS
       window.__MAP_READY__ = false;
       window.__MAP_READY_SENT__ = false;
       window.__BUS_LISTENER_ATTACHED__ = false;
+      window.__pendingBusStopRender = false;
       window.busMarkers = {};
       window.userMarker = null;
       window.userPulse = null;
@@ -144,6 +170,14 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
       map.whenReady(function() {
         window.__MAP_READY__ = true;
         console.log("[WEBVIEW] Map is ready");
+        
+        // Process any pending bus stop render
+        if (window.__pendingBusStopRender && window.__busStops && window.__busStops.length) {
+          console.log("[WEBVIEW] Processing pending bus stop render");
+          window.__pendingBusStopRender = false;
+          if (window.renderBusStops) window.renderBusStops();
+        }
+        
         sendMapReady();
       });
 
@@ -197,9 +231,169 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
 
             case "RECENTER":
               if (window.map && window.userMarker) {
+                window.__isProgrammaticMove = true;
                 const pos = window.userMarker.getLatLng();
                 window.map.flyTo(pos, 15, { duration: 0.5 });
               }
+              break;
+
+            case "INIT_BUS_STOPS":
+              if (!Array.isArray(data.stops)) {
+                console.log("[WEBVIEW] Invalid INIT_BUS_STOPS");
+                return;
+              }
+              // Store bus stops
+              window.__busStops = data.stops;
+              
+              // Check if map is ready
+              if (!window.map) {
+                console.log("[WEBVIEW] Map not ready, queuing bus stops");
+                window.__pendingBusStopRender = true;
+                return;
+              }
+              
+              // Create LayerGroup if not exists (in busStopsPane)
+              if (!window.busStopLayer) {
+                window.busStopLayer = L.layerGroup({ pane: 'busStopsPane' });
+                window.__busStopZoomBucket = null;
+                window.__busStopInitialized = false;
+                window.__busStopMarkers = {}; // Cache individual markers
+              }
+              
+              // Reset for fresh render on INIT
+              window.__busStopZoomBucket = null;
+              window.__busStopInitialized = false;
+              
+              // Bus stop icon (lightweight small circle)
+              function createStopIcon(name) {
+                return L.divIcon({
+                  html: '<div style="width:12px;height:12px;background:#e74c3c;border:2px solid white;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,0.3);"></div>',
+                  className: 'bus-stop-marker',
+                  iconSize: [12, 12],
+                  iconAnchor: [6, 6]
+                });
+              }
+
+              // Create popup for bus stop
+              function createStopPopup(stop) {
+                return '<b>' + (stop.name || 'Bus Stop') + '</b><br>' +
+                  '<div style="margin-top:8px;font-size:12px;color:#666;">Buses at this stop:</div>' +
+                  '<div style="margin-top:4px;font-size:11px;color:#999;">Loading...</div>';
+              }
+
+              // Get zoom bucket category
+              function getZoomBucket(zoom) {
+                if (zoom < 14) return "none";
+                return "all";
+              }
+              
+              // Render function with zoom-based filtering (optimized)
+              function renderBusStops() {
+                if (!window.map || !window.__busStops.length) return;
+
+                const zoom = window.map.getZoom();
+                const bucket = getZoomBucket(zoom);
+
+                // Skip render if bucket hasn't changed (but always render first time)
+                if (bucket === window.__busStopZoomBucket && window.__busStopInitialized) return;
+
+                // Update bucket
+                window.__busStopZoomBucket = bucket;
+
+                // zoom < 14: hide all stops
+                if (bucket === "none") {
+                  window.map.removeLayer(window.busStopLayer);
+                  return;
+                }
+
+                // Show all stops at zoom >= 14
+                const stopsToShow = window.__busStops;
+
+                // Build set of visible stop IDs
+                const visibleIds = {};
+                stopsToShow.forEach(function(stop) {
+                  if (!stop || !stop.id) return;
+                  visibleIds[stop.id] = true;
+                });
+
+                // Hide markers not in current zoom bucket
+                Object.keys(window.__busStopMarkers).forEach(function(stopId) {
+                  if (!visibleIds[stopId]) {
+                    window.busStopLayer.removeLayer(window.__busStopMarkers[stopId]);
+                  }
+                });
+
+                // Show/create markers for visible stops
+                stopsToShow.forEach(function(stop) {
+                  if (!stop || !stop.id || !stop.lat || !stop.lng) return;
+
+                  if (window.__busStopMarkers[stop.id]) {
+                    // Marker exists, just show it
+                    window.busStopLayer.addLayer(window.__busStopMarkers[stop.id]);
+                  } else {
+                    // Create new marker and cache it
+                    const marker = L.marker([stop.lat, stop.lng], {
+                      icon: createStopIcon(stop.name),
+                      pane: 'busStopsPane'
+                    }).bindPopup(createStopPopup(stop), {
+                      pane: 'busStopsPopupPane',
+                      autoClose: true,
+                      closeOnClick: true
+                    });
+                    window.__busStopMarkers[stop.id] = marker;
+                    window.busStopLayer.addLayer(marker);
+                  }
+                });
+
+                // Show layer (only add if not already on map)
+                if (!window.map.hasLayer(window.busStopLayer)) {
+                  window.map.addLayer(window.busStopLayer);
+                }
+
+                // Mark as initialized after first render
+                window.__busStopInitialized = true;
+              }
+              
+              // Update on zoom change
+              window.map.off('zoomend', renderBusStops);
+              window.map.on('zoomend', renderBusStops);
+
+              // Track viewport bounds for dynamic stop loading
+              window.__lastBounds = null;
+              window.__boundsDebounce = null;
+
+              window.map.on('moveend', function() {
+                const bounds = map.getBounds();
+                const currentBounds = {
+                  minLat: bounds.getSouth(),
+                  maxLat: bounds.getNorth(),
+                  minLng: bounds.getWest(),
+                  maxLng: bounds.getEast()
+                };
+
+                // Debounce and check if bounds actually changed
+                clearTimeout(window.__boundsDebounce);
+                window.__boundsDebounce = setTimeout(function() {
+                  // Only send if bounds changed significantly
+                  if (!window.__lastBounds ||
+                    Math.abs(window.__lastBounds.minLat - currentBounds.minLat) > 0.01 ||
+                    Math.abs(window.__lastBounds.maxLat - currentBounds.maxLat) > 0.01 ||
+                    Math.abs(window.__lastBounds.minLng - currentBounds.minLng) > 0.01 ||
+                    Math.abs(window.__lastBounds.maxLng - currentBounds.maxLng) > 0.01) {
+                    window.__lastBounds = currentBounds;
+                    window.ReactNativeWebView.postMessage(JSON.stringify({
+                      type: "MAP_BOUNDS",
+                      bounds: currentBounds
+                    }));
+                    console.log("[WEBVIEW] Sent MAP_BOUNDS:", currentBounds);
+                  }
+                }, 500); // 500ms debounce
+              });
+
+              // Initial render (will always run due to initialized = false)
+              renderBusStops();
+              
+              console.log("[WEBVIEW] Bus stops loaded:", data.stops.length);
               break;
 
             case "BUS_OFFLINE":
@@ -230,14 +424,12 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
 
               // Process buses
               data.buses.forEach(function(bus) {
-                if (!bus || !bus._id) return;
-                var busLat = bus.lat ?? bus.latitude;
-                var busLng = bus.lng ?? bus.longitude;
-                if (typeof busLat !== "number" || typeof busLng !== "number") return;
+                if (!bus || !bus.busId) return;
+                if (!bus.lat || !bus.lng) return;
 
-                var marker = window.busMarkers[bus._id];
+                var marker = window.busMarkers[bus.busId];
                 if (marker) {
-                  marker.setLatLng([busLat, busLng]);
+                  marker.setLatLng([bus.lat, bus.lng]);
                   if (bus.lastUpdate) marker._ts = bus.lastUpdate;
                 } else {
                   var busIcon = L.divIcon({
@@ -246,23 +438,26 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
                     iconSize: [30, 30],
                     iconAnchor: [15, 15]
                   });
-                  var newMarker = L.marker([busLat, busLng], { icon: busIcon }).addTo(window.map);
+                  var newMarker = L.marker([bus.lat, bus.lng], { icon: busIcon, pane: 'busesPane' }).addTo(window.map);
                   if (bus.lastUpdate) newMarker._ts = bus.lastUpdate;
-                  window.busMarkers[bus._id] = newMarker;
+                  window.busMarkers[bus.busId] = newMarker;
                 }
               });
 
               // Cleanup stale markers (not in current update)
-              var currentIds = {};
-              data.buses.forEach(function(b) { if (b && b._id) currentIds[b._id] = true; });
-              Object.keys(window.busMarkers).forEach(function(id) {
-                if (!currentIds[id]) {
-                  if (window.map && window.map.removeLayer) {
-                    window.map.removeLayer(window.busMarkers[id]);
+              // Skip cleanup when data is empty to prevent markers from disappearing
+              if (data.buses.length > 0) {
+                var currentIds = {};
+                data.buses.forEach(function(b) { if (b && b.busId) currentIds[b.busId] = true; });
+                Object.keys(window.busMarkers).forEach(function(id) {
+                  if (!currentIds[id]) {
+                    if (window.map && window.map.removeLayer) {
+                      window.map.removeLayer(window.busMarkers[id]);
+                    }
+                    delete window.busMarkers[id];
                   }
-                  delete window.busMarkers[id];
-                }
-              });
+                });
+              }
 
               console.log("[WEBVIEW] Active buses:", Object.keys(window.busMarkers).length);
               break;
@@ -319,22 +514,34 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
       }
 
       // SINGLE POPUP GENERATOR with toggle switch
+      // NOTE: Speed removed - now shown in React Native Speedometer overlay only
       function getBusPopup(bus) {
         const isFollowing = window.__followBusId === bus.id;
-        const speed = Math.round(bus.speed || 0);
-        const eta = bus.eta ?? "--";
-        return \`
-          <div class="bus-popup">
-            <div class="bus-popup-header">\${bus.name || "Bus"}</div>
-            <div class="bus-popup-row">Speed: \${speed} km/h</div>
-            <div class="bus-popup-row">ETA: \${eta} min</div>
-            <label class="follow-toggle">
-              <input type="checkbox" \${isFollowing ? 'checked' : ''} onchange="toggleFollow('\${bus.id}')">
-              <span class="toggle-slider"></span>
-              <span class="toggle-label">\${isFollowing ? 'Following' : 'Follow'}</span>
-            </label>
-          </div>
-        \`;
+        const checkedAttr = isFollowing ? 'checked' : '';
+        const labelText = isFollowing ? 'Following' : 'Follow';
+        return '<div class="bus-popup">' +
+          '<div class="bus-popup-header">' + (bus.name || "Bus") + '</div>' +
+          '<label class="follow-toggle">' +
+            '<input type="checkbox" ' + checkedAttr + ' data-bus-id="' + bus.id + '">' +
+            '<span class="toggle-slider"></span>' +
+            '<span class="toggle-label">' + labelText + '</span>' +
+          '</label>' +
+        '</div>';
+      }
+
+      // UPDATE BUS POPUP (keeps popup in sync with bus data)
+      function updateBusPopup(marker, bus) {
+        if (!marker || !marker.getPopup()) return;
+        
+        // Update popup content with latest data
+        marker.setPopupContent(getBusPopup(bus));
+        
+        // If following this bus, ensure popup stays open
+        if (window.__followBusId === (bus.busId || bus.id)) {
+          if (!marker.getPopup().isOpen()) {
+            marker.openPopup();
+          }
+        }
       }
 
       // TOGGLE FOLLOW with optimistic UI update
@@ -349,11 +556,16 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
           marker.setPopupContent(getBusPopup(marker.__busData));
         }
 
-        // Send to React Native
+        // If unfollowing, close the popup
+        if (wasFollowing && marker) {
+          marker.closePopup();
+        }
+
+        // Send final follow state to React Native (not toggle)
         window.ReactNativeWebView.postMessage(
           JSON.stringify({
-            type: "TOGGLE_FOLLOW",
-            busId,
+            type: "SET_FOLLOW",
+            busId: window.__followBusId, // null if unfollowing, or busId if following
           })
         );
       };
@@ -361,17 +573,52 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
       // RECENTER FUNCTION
       function recenterToUser() {
         if (!window.map || !window.userMarker) return;
+        window.__isProgrammaticMove = true;
         const pos = window.userMarker.getLatLng();
         window.map.flyTo(pos, 15, { duration: 0.5 });
       }
 
-      // DRAG DETECTION
-      window.map.on("dragstart", () => {
-        window.__userDragging = true;
+      // DRAG DETECTION - only trigger for user-initiated drags, not programmatic flyTo
+      window.__userDragging = false;
+      window.__isProgrammaticMove = false;
 
-        window.ReactNativeWebView.postMessage(
-          JSON.stringify({ type: "FOLLOW_STOPPED" })
-        );
+      window.map.on("dragstart", () => {
+        // Only send FOLLOW_STOPPED if this is a user-initiated drag
+        if (!window.__isProgrammaticMove && window.__followBusId) {
+          window.__userDragging = true;
+          window.ReactNativeWebView.postMessage(
+            JSON.stringify({
+              type: "FOLLOW_STOPPED",
+              reason: "USER_DRAG",
+            })
+          );
+        }
+      });
+
+      window.map.on("moveend", () => {
+        window.__isProgrammaticMove = false;
+        setTimeout(() => {
+          window.__userDragging = false;
+        }, 100);
+      });
+
+      // POPUP EVENT DELEGATION - Handle checkbox clicks safely
+      document.addEventListener('click', function(e) {
+        const checkbox = e.target.closest('.bus-popup input[type="checkbox"]');
+        if (checkbox) {
+          const busId = checkbox.getAttribute('data-bus-id');
+          if (busId) {
+            window.toggleFollow(busId);
+          }
+        }
+      });
+
+      // MAP CLICK HANDLER - Close popup only if not following
+      window.map.on("click", () => {
+        // Only close popup if not following (follow mode keeps popup open)
+        if (!window.__followBusId) {
+          window.map.closePopup();
+        }
       });
 
       // UPDATE BUS MARKER (no recreation)
@@ -381,13 +628,12 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
 
       function updateBusMarker(data) {
         if (!window.map || !data.busId) return;
+        if (!data.lat || !data.lng) return;
 
         const busId = data.busId;
-        const lat = data.latitude ?? data.lat;
-        const lng = data.longitude ?? data.lng;
+        const lat = data.lat;
+        const lng = data.lng;
         const speed = data.speed ?? 0;
-
-        if (typeof lat !== "number" || typeof lng !== "number") return;
 
         const busData = {
           id: busId,
@@ -400,7 +646,11 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
           // CREATE NEW MARKER
           const marker = L.marker([lat, lng]).addTo(window.map);
 
-          marker.bindPopup(getBusPopup(busData));
+          // Bind popup with persistent settings (autoClose: false, closeOnClick: false)
+          marker.bindPopup(getBusPopup(busData), {
+            autoClose: false,
+            closeOnClick: false
+          });
           window.busMarkers[busId] = marker;
         }
 
@@ -411,18 +661,17 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
         // Update position
         marker.setLatLng([lat, lng]);
 
-        // Update popup content safely (only if open)
-        if (marker.getPopup()?.isOpen()) {
-          marker.setPopupContent(getBusPopup(busData));
-        }
+        // Update popup content (keeps popup in sync with moving bus)
+        updateBusPopup(marker, busData);
 
-        // CAMERA FOLLOW (throttled)
+        // CAMERA FOLLOW (throttled 1000ms for smooth following)
         if (
           window.__followBusId === busId &&
           !window.__userDragging &&
-          Date.now() - window.__lastFlyTo > 500
+          Date.now() - window.__lastFlyTo > 1000
         ) {
           window.__lastFlyTo = Date.now();
+          window.__isProgrammaticMove = true;
 
           window.map.flyTo([lat, lng], window.map.getZoom(), {
             duration: 0.5,
@@ -453,7 +702,88 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
 </html>
   `;
 
-  // Handle MAP_READY from WebView - idempotent, always resend USER_LOCATION
+  // Add ref for buses to resend on MAP_READY
+  const busesRef = useRef(buses);
+
+  // Keep ref in sync with props
+  useEffect(() => {
+    busesRef.current = buses;
+  }, [buses]);
+
+  // Add refs for bounds debounce
+  const boundsDebounceRef = useRef(null);
+  const lastBoundsRef = useRef(null);
+
+  // Fetch stops with bounds
+  const fetchStopsWithBounds = async (bounds) => {
+    try {
+      const url = `${API_BASE_URL}/api/bus-stops?minLat=${bounds.minLat}&maxLat=${bounds.maxLat}&minLng=${bounds.minLng}&maxLng=${bounds.maxLng}`;
+
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (data.success && webViewRef.current) {
+        const mergedStops = mergeStops(data.stops);
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "INIT_BUS_STOPS",
+          stops: mergedStops
+        }));
+        console.log("[RN] Fetched stops with bounds:", data.count, "merged:", mergedStops.length);
+      }
+    } catch (error) {
+      console.log("[RN] Bounds fetch error:", error.message);
+    }
+  };
+
+  // Static bus stops (manual coordinates)
+  const STATIC_STOPS = [
+    // VELLORE DISTRICT
+    { id: "vellore_1", name: "Vellore New Bus Station", lat: 12.9346, lng: 79.1366 },
+    { id: "vellore_2", name: "Vellore Old Bus Stand", lat: 12.9223, lng: 79.1325 },
+    { id: "vellore_3", name: "Vellore Smart City Bus Stand", lat: 12.9347, lng: 79.1376 },
+    { id: "vellore_4", name: "CMC Jubilee Gate", lat: 12.9245, lng: 79.1376 },
+    { id: "vellore_5", name: "Vallalar Bus Stop", lat: 12.9383, lng: 79.1669 },
+    { id: "vellore_6", name: "Thottapalayam Bus Stand", lat: 12.9244, lng: 79.1273 },
+    { id: "vellore_7", name: "TNSTC Depot Vellore", lat: 12.9245, lng: 79.1149 },
+    { id: "vellore_8", name: "Sainathapuram Bus Stop", lat: 12.8970, lng: 79.1352 },
+    { id: "vellore_9", name: "Katpadi Bus Stand", lat: 12.9672, lng: 79.1374 },
+    // THIRUVALLUR DISTRICT
+    { id: "tvlr_1", name: "Thiruvallur Bus Stand", lat: 13.1386, lng: 79.9076 },
+    { id: "tvlr_2", name: "Thiruvallur Terminal", lat: 13.1405, lng: 79.9080 },
+    { id: "tvlr_3", name: "Oil Mill Bus Stop", lat: 13.1227, lng: 79.9118 },
+    { id: "tvlr_4", name: "Theradi Bus Stop", lat: 13.1433, lng: 79.9088 },
+    { id: "tvlr_5", name: "Court Bus Stop", lat: 13.1370, lng: 79.9176 },
+    { id: "tvlr_6", name: "Kakkalur Bus Stand", lat: 13.1227, lng: 79.9118 },
+    { id: "tvlr_7", name: "Manavalanagar Bus Stop", lat: 13.1126, lng: 79.9133 },
+    { id: "tvlr_8", name: "Ondikuppam Bus Stop", lat: 13.1104, lng: 79.9180 },
+    { id: "tvlr_9", name: "SBI JN Road Bus Stop", lat: 13.1354, lng: 79.9087 }
+  ];
+
+  // Deduplicate stops by proximity (±0.0005)
+  const mergeStops = (osmStops) => {
+    if (!osmStops || !Array.isArray(osmStops)) return STATIC_STOPS;
+
+    const merged = [...STATIC_STOPS];
+    const proximityThreshold = 0.0005;
+
+    osmStops.forEach(osmStop => {
+      if (!osmStop || !osmStop.lat || !osmStop.lng) return;
+
+      const isDuplicate = merged.some(staticStop => {
+        const latDiff = Math.abs(staticStop.lat - osmStop.lat);
+        const lngDiff = Math.abs(staticStop.lng - osmStop.lng);
+        return latDiff < proximityThreshold && lngDiff < proximityThreshold;
+      });
+
+      if (!isDuplicate) {
+        merged.push(osmStop);
+      }
+    });
+
+    return merged;
+  };
+
+  // Handle MAP_READY from WebView - idempotent, always resend data
   const handleWebViewMessage = (event) => {
     try {
       if (!event || !event.nativeEvent || !event.nativeEvent.data) return;
@@ -463,53 +793,86 @@ const MiniMap = ({ webViewRef, setWebViewReady, onPress, buses, userLocation }) 
 
       // Idempotent MAP_READY handling - safe for duplicates
       if (data.type === "MAP_READY") {
-        const alreadyReady = webViewReady;
-        console.log("[RN] MAP_READY received (alreadyReady:", alreadyReady, ")");
+        console.log("[RN MiniMap] MAP_READY received");
         
         // Always mark as ready (idempotent)
-        if (!alreadyReady) {
-          setWebViewReady(true);
-        }
+        setWebViewReady(true);
 
-        // ALWAYS resend cached user location on MAP_READY (recovery mechanism)
-        if (lastUserLocationRef.current && webViewRef.current) {
+        // Resend user location on MAP_READY (recovery mechanism)
+        if (userLocation && webViewRef.current) {
           webViewRef.current.postMessage(JSON.stringify({
             type: "USER_LOCATION",
             payload: {
-              lat: lastUserLocationRef.current.lat,
-              lng: lastUserLocationRef.current.lng
+              lat: userLocation.latitude,
+              lng: userLocation.longitude
             }
           }));
-          console.log("[RN] USER_LOCATION resent on MAP_READY");
+          console.log("[RN MiniMap] USER_LOCATION resent on MAP_READY");
         }
 
-        // ALSO resend FOLLOW_UPDATE on MAP_READY
+        // Resend FOLLOW_UPDATE on MAP_READY
         if (webViewRef.current) {
           webViewRef.current.postMessage(JSON.stringify({
             type: "FOLLOW_UPDATE",
             busId: followBusId
           }));
-          console.log("[RN] FOLLOW_UPDATE resent on MAP_READY");
+          console.log("[RN MiniMap] FOLLOW_UPDATE resent on MAP_READY:", followBusId);
+        }
+
+        // Resend BUS_UPDATE on MAP_READY
+        const busesArray = busesRef.current ? Object.values(busesRef.current) : [];
+        const activeBuses = busesArray.filter(bus =>
+          bus && bus.busId && bus.lat && bus.lng
+        );
+        if (activeBuses.length > 0 && webViewRef.current) {
+          webViewRef.current.postMessage(JSON.stringify({
+            type: "BUS_UPDATE",
+            buses: activeBuses
+          }));
+          console.log("[RN MiniMap] BUS_UPDATE resent on MAP_READY:", activeBuses.length);
         }
       }
       
       // PING → MAP_READY recovery (optional handshake)
       if (data.type === "PING") {
-        console.log("[RN] PING received, responding with PONG");
+        console.log("[RN MiniMap] PING received, responding with PONG");
         webViewRef.current?.postMessage(JSON.stringify({ type: "PONG" }));
       }
 
       // FOLLOW_STOPPED from WebView (user dragged map)
       if (data.type === "FOLLOW_STOPPED") {
-        console.log("[RN] FOLLOW_STOPPED from MiniMap WebView");
+        console.log("[RN MiniMap] FOLLOW_STOPPED from WebView");
         setFollowBusId(null);
         return;
       }
 
-      // TOGGLE_FOLLOW from WebView (popup button clicked)
-      if (data.type === "TOGGLE_FOLLOW") {
-        console.log("[RN] TOGGLE_FOLLOW from MiniMap:", data.busId);
-        setFollowBusId(prev => prev === data.busId ? null : data.busId);
+      // SET_FOLLOW from WebView (popup toggle - final state)
+      if (data.type === "SET_FOLLOW") {
+        console.log("[RN MiniMap] SET_FOLLOW from WebView:", data.busId);
+        setFollowBusId(data.busId || null);
+        return;
+      }
+
+      // MAP_BOUNDS from WebView (viewport changed)
+      if (data.type === "MAP_BOUNDS" && data.bounds) {
+        // Debounce to prevent rapid API calls
+        clearTimeout(boundsDebounceRef.current);
+
+        // Check if bounds changed significantly
+        const bounds = data.bounds;
+        const lastBounds = lastBoundsRef.current;
+        const boundsChanged = !lastBounds ||
+          Math.abs(lastBounds.minLat - bounds.minLat) > 0.01 ||
+          Math.abs(lastBounds.maxLat - bounds.maxLat) > 0.01 ||
+          Math.abs(lastBounds.minLng - bounds.minLng) > 0.01 ||
+          Math.abs(lastBounds.maxLng - bounds.maxLng) > 0.01;
+
+        if (boundsChanged) {
+          lastBoundsRef.current = bounds;
+          boundsDebounceRef.current = setTimeout(() => {
+            fetchStopsWithBounds(bounds);
+          }, 500); // 500ms debounce
+        }
         return;
       }
     } catch (e) {
@@ -567,12 +930,16 @@ const HomeScreen = () => {
   
   // Local follow state (single source of truth for this screen)
   const [followBusId, setFollowBusId] = useState(null);
+  
+  // Get followed bus data for speedometer
+  const followedBus = followBusId ? buses[followBusId] : null;
   const [sosAlerts, setSosAlerts] = useState([]);
   const webViewRef = useRef(null);
   const retryTimeoutRef = useRef(null);
   const messageQueueRef = useRef({});
   const lastSentRef = useRef(null);
   const lastUserLocationRef = useRef(null); // Cache for resend on WebView load
+  const busStopsRef = useRef(null); // Cache bus stops for resend
   const [webViewReady, setWebViewReady] = useState(false);
 
   // Track alerted SOS buses to prevent duplicate alerts
@@ -614,33 +981,30 @@ const HomeScreen = () => {
       webViewRef.current.postMessage(JSON.stringify(msg));
       console.log("[RN] Sent FOLLOW_UPDATE to MiniMap:", followBusId);
     }
-  }, [followBusId, webViewReady]);
+  }, [followBusId]);
 
-  // Send BUS_UPDATE to WebView when buses change and WebView is ready
+  // Send BUS_UPDATE to WebView when buses change
   useEffect(() => {
-    console.log("[RN] Bus Update Effect - webViewReady:", webViewReady, "webViewRef:", !!webViewRef.current);
-    // TEMPORARILY BYPASSED FOR TESTING - uncomment guard after verifying communication
-    // if (!webViewReady || !webViewRef.current) {
-    //   console.log("[RN] Skipping bus update - WebView not ready");
-    //   return;
-    // }
     if (!webViewRef.current) {
       console.log("[RN] Skipping bus update - no WebView ref");
       return;
     }
 
     // Convert buses object to array and filter active buses with valid coordinates
+
     const busesArray = buses ? Object.values(buses) : [];
+
     console.log("[RN] Buses state raw:", buses);
+
     console.log("[RN] Buses array count:", busesArray.length);
+
     console.log("[RN] Buses sample:", busesArray.slice(0, 2));
     
     const activeBuses = busesArray.filter(bus =>
       bus &&
-      bus._id &&
-      bus.trackingActive === true &&
-      typeof bus.lat === "number" &&
-      typeof bus.lng === "number"
+      bus.busId &&
+      bus.lat &&
+      bus.lng
     );
     
     console.log("[RN] Active buses for MiniMap:", activeBuses.length);
@@ -648,9 +1012,9 @@ const HomeScreen = () => {
     // ORDER-INDEPENDENT + NOISE-REDUCED SIGNATURE
     const signature = activeBuses
       .slice()
-      .sort((a, b) => (a._id > b._id ? 1 : -1))
+      .sort((a, b) => (a.busId > b.busId ? 1 : -1))
       .map(b =>
-        b._id +
+        b.busId +
         "_" +
         b.lat.toFixed(5) +
         "_" +
@@ -687,10 +1051,9 @@ const HomeScreen = () => {
       const latestBusesArray = buses ? Object.values(buses) : [];
       const latestActiveBuses = latestBusesArray.filter(bus =>
         bus &&
-        bus._id &&
-        bus.trackingActive === true &&
-        typeof bus.lat === "number" &&
-        typeof bus.lng === "number"
+        bus.busId &&
+        bus.lat &&
+        bus.lng
       );
 
       const latestPayload = JSON.stringify({
@@ -701,7 +1064,7 @@ const HomeScreen = () => {
       ref.postMessage(latestPayload);
       console.log("[RN] Retry send active buses:", latestActiveBuses.length);
     }, 300);
-  }, [webViewReady, buses]);
+  }, [buses]);
 
   // Socket listener for BUS_LOCATION_UPDATE with logging
   useEffect(() => {
@@ -727,6 +1090,46 @@ const HomeScreen = () => {
       }
     };
   }, []);
+
+  // Fetch bus stops once and send to WebView
+  useEffect(() => {
+    const fetchBusStops = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/bus-stops`);
+        const data = await response.json();
+
+        if (data.success && data.stops) {
+          const mergedStops = mergeStops(data.stops);
+          console.log("[RN] Fetched bus stops:", data.count, "merged:", mergedStops.length);
+
+          // Store for resend on WebView reload
+          busStopsRef.current = mergedStops;
+
+          // Send to WebView if ready
+          if (webViewRef.current && webViewReady) {
+            webViewRef.current.postMessage(JSON.stringify({
+              type: "INIT_BUS_STOPS",
+              stops: mergedStops
+            }));
+          }
+        }
+      } catch (err) {
+        console.log("[RN] Failed to fetch bus stops:", err.message);
+      }
+    };
+    
+    fetchBusStops();
+  }, []); // Fetch only once on mount
+  
+  // Send bus stops when WebView becomes ready (if already fetched)
+  useEffect(() => {
+    if (webViewReady && webViewRef.current && busStopsRef.current) {
+      webViewRef.current.postMessage(JSON.stringify({
+        type: "INIT_BUS_STOPS",
+        stops: busStopsRef.current
+      }));
+    }
+  }, [webViewReady]);
 
   // Fetch user location
   useEffect(() => {
@@ -841,9 +1244,19 @@ const HomeScreen = () => {
             onPress={handleMapPress}
             buses={filteredBuses}
             userLocation={userLocation}
+            followBusId={followBusId}
+            setFollowBusId={setFollowBusId}
           />
         </View>
       </ScrollView>
+      
+      {/* Speedometer Overlay - only visible when following a bus */}
+      {followBusId && followedBus && (
+        <Speedometer
+          key={followBusId}
+          speed={followedBus.speed}
+        />
+      )}
     </SafeAreaView>
   );
 };

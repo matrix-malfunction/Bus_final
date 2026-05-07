@@ -40,7 +40,7 @@ let isCheckingSOS = false;
 let lastRequestId = 0;
 
 // Constants for GPS filtering
-const DUPLICATE_THRESHOLD_METERS = 2; // Skip if moved less than 2m
+const DUPLICATE_THRESHOLD_METERS = 10; // Skip if moved less than 10m (prevents GPS drift noise)
 const EXTREME_JUMP_THRESHOLD_METERS = 1000; // Skip if jumped more than 1km
 
 // Helper: async delay (replaces setTimeout)
@@ -58,6 +58,36 @@ const haversineMeters = (lat1, lng1, lat2, lng2) => {
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
 };
+
+// Calculate speed using Haversine distance and time delta
+// Replaces unreliable GPS speed when stationary
+function calculateSpeed(prev, curr) {
+  if (!prev || !prev.latitude || !prev.longitude || !prev.timestamp) {
+    return null; // No previous location to compare
+  }
+
+  const distance = haversineMeters(prev.latitude, prev.longitude, curr.latitude, curr.longitude);
+  const timeDiff = (curr.timestamp - prev.timestamp) / 1000; // seconds
+
+  // STRICT: Need at least 1 second AND 10 meters movement (prevents GPS drift noise)
+  if (timeDiff < 1 || distance < 10) {
+    return 0;
+  }
+
+  // Speed in m/s
+  const speedMps = distance / timeDiff;
+
+  // Noise filter: if speed < 1 m/s (3.6 km/h), consider stationary
+  if (speedMps < 1) {
+    return 0;
+  }
+
+  // Clamp unrealistic speeds (>40 m/s = 144 km/h)
+  return Math.min(speedMps, 40);
+}
+
+// Foreground last location store (for speed calculation)
+let fgLastLocation = null;
 
 // Define background location task - sends location to backend even when app is killed
 TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
@@ -81,7 +111,15 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
     const accuracy = location.coords?.accuracy;
     const altitude = location.coords?.altitude;
     const heading = location.coords?.heading;
-    const speed = location.coords?.speed;
+    // IGNORE GPS speed - compute using Haversine instead
+    const gpsSpeed = location.coords?.speed;
+
+    // Compute speed using Haversine (more reliable than GPS when stationary)
+    const now = Date.now();
+    const currLocation = { latitude: Number(rawLat), longitude: Number(rawLng), timestamp: now };
+    const computedSpeedMps = calculateSpeed(global.bgLastLocation, currLocation);
+    // Use computed speed if available, otherwise fall back to GPS speed
+    const finalSpeed = computedSpeedMps !== null ? computedSpeedMps : (gpsSpeed || 0);
 
     // Safely parse to numbers
     const latitude = Number(rawLat);
@@ -96,9 +134,9 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
     // Debug log
     console.log("[BG TASK] Location received:", latitude.toFixed(6), longitude.toFixed(6), "accuracy:", accuracy);
 
-    // Skip low accuracy locations (>100m)
-    if (accuracy && accuracy > 100) {
-      console.log("[BG TASK] Low accuracy (" + accuracy + "m), skipping");
+    // GPS DRIFT FILTER: Skip low accuracy locations (>50m)
+    if (accuracy && accuracy > 50) {
+      console.log("[BG TASK] Skipped - low accuracy:", accuracy.toFixed(1), "m");
       return;
     }
 
@@ -141,7 +179,7 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
       accuracy: accuracy || null,
       altitude: altitude || null,
       heading: heading || null,
-      speed: speed || null,
+      speed: finalSpeed, // Computed speed (Haversine), not GPS
       source: "background_task",
       timestamp: new Date().toISOString(),
     };
@@ -405,10 +443,22 @@ export default function DriverTrackingScreen({ token }) {
       return;
     }
 
-    const { latitude, longitude, accuracy, altitude, heading, speed } = location;
-
+    const { latitude, longitude, accuracy, altitude, heading } = location;
+    
+    // GPS DRIFT FILTER: Skip low accuracy locations (>50m)
+    if (accuracy && accuracy > 50) {
+      console.log("[API] Skipped - low accuracy:", accuracy.toFixed(1), "m");
+      return;
+    }
+    
     // STRICT THROTTLE: Check API rate limiting (5 seconds)
     const now = Date.now();
+    
+    // IGNORE GPS speed - compute using Haversine instead (more reliable when stationary)
+    const currLocation = { latitude, longitude, timestamp: now };
+    const computedSpeedMps = calculateSpeed(fgLastLocation, currLocation);
+    const finalSpeed = computedSpeedMps !== null ? computedSpeedMps : (location.speed || 0);
+
     const timeSinceLastSend = now - lastSendTimeRef.current;
     if (timeSinceLastSend < MIN_API_INTERVAL_MS) {
       console.log("[API] BLOCKED - throttled:", (MIN_API_INTERVAL_MS - timeSinceLastSend), "ms remaining");
@@ -478,7 +528,7 @@ export default function DriverTrackingScreen({ token }) {
         accuracy: accuracy || null,
         altitude: altitude || null,
         heading: heading || null,
-        speed: speed || null,
+        speed: finalSpeed, // Computed speed (Haversine), not GPS
         source: isFromQueue ? "queue_retry" : "watch_position",
         timestamp: new Date().toISOString(),
       };
@@ -508,6 +558,10 @@ export default function DriverTrackingScreen({ token }) {
       console.log("[API] Success - location sent to backend");
       setLastSentLocation({ latitude, longitude });
       saveLastSent({ latitude, longitude });
+      
+      // Update last location for speed calculation ONLY after successful send
+      // This prevents GPS drift from accumulating error
+      fgLastLocation = { latitude, longitude, timestamp: Date.now() };
 
       // If this was from queue, remove it
       if (isFromQueue) {

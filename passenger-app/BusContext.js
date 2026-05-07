@@ -42,6 +42,7 @@ export function BusProvider({ children }) {
           busId: data.busId,
           lat: data.latitude,
           lng: data.longitude,
+          speed: data.speed ?? 0,  // Include speed from backend
           trackingActive: data.trackingActive !== false,
           lastUpdate: Date.now()
         };
