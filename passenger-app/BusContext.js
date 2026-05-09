@@ -49,8 +49,31 @@ export function BusProvider({ children }) {
   const [busProgress, setBusProgress] = useState({}); // Bus progression state
 
   useEffect(() => {
-    const newSocket = io(API_BASE_URL);
+    const newSocket = io(API_BASE_URL, {
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      timeout: 20000,
+      transports: ["websocket"]
+    });
     setSocket(newSocket);
+
+    // Socket connection event logging
+    newSocket.on("connect", () => {
+      console.log("[BusContext] Socket connected");
+    });
+
+    newSocket.on("disconnect", (reason) => {
+      console.log("[BusContext] Socket disconnected:", reason);
+    });
+
+    newSocket.on("reconnect", (attemptNumber) => {
+      console.log("[BusContext] Socket reconnected after", attemptNumber, "attempts");
+    });
+
+    newSocket.on("connect_error", (error) => {
+      console.log("[BusContext] Socket connection error:", error.message);
+    });
 
     // Listen for BUS_LOCATION_UPDATE from backend
     newSocket.on("BUS_LOCATION_UPDATE", (data) => {

@@ -271,12 +271,14 @@ export default function FullMapScreen({ route }) {
           JSON.stringify({
             type: "STOP_PROGRESSION",
             busId,
+            tripId: progress.tripId, // For route switch detection
             nextStopIndex: progress.nextStopIndex,
             currentStopIndex: progress.currentStopIndex,
+            passedStopIds: progress.passedStopIds || [],
             etaMinutes: progress.etaMinutes,
           })
         );
-        console.log("[FullMap RN] STOP_PROGRESSION sent for", busId, "next stop:", progress.nextStopIndex);
+        console.log("[FullMap RN] STOP_PROGRESSION sent for", busId, "next stop:", progress.nextStopIndex, "passed:", progress.passedStopIds?.length || 0);
       }
     });
   }, [busProgress, webViewReady]);
@@ -637,6 +639,44 @@ export default function FullMapScreen({ route }) {
             background: #007AFF;
             color: white;
           }
+          /* Passed stop styling - dimmed */
+          .passed-stop .bus-stop-icon {
+            background: #e5e7eb;
+            border-color: #9ca3af;
+            color: #6b7280;
+            opacity: 0.4;
+            transform: scale(0.9);
+          }
+          .passed-stop .bus-stop-label {
+            background: #e5e7eb;
+            color: #6b7280;
+            opacity: 0.5;
+            transform: scale(0.9);
+          }
+          /* Next stop highlight styling - emphasized */
+          .highlighted-stop .bus-stop-icon {
+            background: #f59e0b;
+            border-color: #d97706;
+            color: white;
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.4);
+            transform: scale(1.15);
+          }
+          .highlighted-stop .bus-stop-label {
+            background: #f59e0b;
+            color: white;
+            font-weight: 600;
+            transform: scale(1.1);
+          }
+          .stop-eta {
+            background: #10b981;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-size: 9px;
+            font-weight: 600;
+            margin-top: 2px;
+            white-space: nowrap;
+          }
           /* User Popup */
           .user-popup {
             padding: 8px 12px;
@@ -670,7 +710,12 @@ export default function FullMapScreen({ route }) {
           .bus-marker-container {
             /* Reset Leaflet default positioning */
           }
-          
+          /* Route corridor styling - reduced visual dominance */
+          .route-corridor {
+            color: #007AFF;
+            weight: 5;
+            opacity: 0.35;
+          }
           .bus-marker {
             position: relative;
             width: 48px;
@@ -680,27 +725,139 @@ export default function FullMapScreen({ route }) {
             transition: transform 0.3s ease;
           }
           
+          /* Scale wrapper for followed bus (separate from heading rotation) */
+          .bus-marker__scale-wrapper {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            transform-origin: center center;
+            transition: transform 0.3s ease;
+            z-index: 2;
+          }
+          
           /* Glow effect for followed bus */
           .bus-marker__glow {
             position: absolute;
             top: 50%;
             left: 50%;
-            width: 56px;
-            height: 56px;
+            width: 70px;
+            height: 70px;
             transform: translate(-50%, -50%);
-            background: radial-gradient(circle, rgba(0,122,255,0.4) 0%, transparent 70%);
+            background: radial-gradient(circle, rgba(0,122,255,0.6) 0%, transparent 70%);
             border-radius: 50%;
             opacity: 0;
             transition: opacity 0.3s ease;
             z-index: 1;
           }
           
-          .bus-marker--followed {
-            transform: scale(1.1);
+          /* Pulse animation for followed bus */
+          .bus-marker__pulse {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 60px;
+            height: 60px;
+            transform: translate(-50%, -50%);
+            border: 2px solid rgba(0,122,255,0.8);
+            border-radius: 50%;
+            z-index: 0;
+            display: none;
+            animation: pulse-ring 2s ease-out infinite;
+          }
+          
+          @keyframes pulse-ring {
+            0% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+            100% { transform: translate(-50%, -50%) scale(2); opacity: 0; }
+          }
+          
+          .bus-marker--followed .bus-marker__scale-wrapper {
+            transform: translate(-50%, -50%) scale(1.3);
           }
           
           .bus-marker--followed .bus-marker__glow {
             opacity: 1;
+          }
+          
+          .bus-marker--followed .bus-marker__pulse {
+            display: block;
+          }
+
+          /* MOVING BUS STATE - speed > 5 km/h */
+          .bus-marker--moving .bus-marker__scale-wrapper {
+            transform: translate(-50%, -50%) scale(1.05);
+          }
+          .bus-marker--moving .bus-marker__direction {
+            opacity: 1;
+            filter: brightness(1.2);
+          }
+          .bus-marker--moving .bus-marker__pulse {
+            animation-duration: 1.5s;
+            border-color: rgba(0,122,255,0.9);
+          }
+
+          /* STOPPED BUS STATE - speed <= 5 km/h */
+          .bus-marker--stopped {
+            opacity: 0.8;
+          }
+          .bus-marker--stopped .bus-marker__pulse {
+            animation-duration: 3s;
+            border-color: rgba(0,122,255,0.4);
+          }
+          .bus-marker--stopped .bus-marker__body {
+            filter: grayscale(0.2);
+          }
+
+          /* ARRIVING BUS STATE - remainingDistanceKm < 0.2 */
+          .bus-marker--arriving .bus-marker__scale-wrapper {
+            transform: translate(-50%, -50%) scale(1.15);
+          }
+          .bus-marker--arriving .bus-marker__pulse {
+            animation-duration: 1s;
+            border-color: rgba(16,185,129,0.9);
+            border-width: 3px;
+          }
+          .bus-marker--arriving .bus-marker__glow {
+            background: radial-gradient(circle, rgba(16,185,129,0.5) 0%, transparent 70%);
+          }
+
+          /* SOS BUS STATE - emergency */
+          .bus-marker--sos .bus-marker__scale-wrapper {
+            transform: translate(-50%, -50%) scale(1.2);
+          }
+          .bus-marker--sos .bus-marker__pulse {
+            display: block;
+            animation-duration: 0.8s;
+            border-color: rgba(220,38,38,0.9);
+            border-width: 3px;
+          }
+          .bus-marker--sos .bus-marker__glow {
+            background: radial-gradient(circle, rgba(220,38,38,0.6) 0%, transparent 70%);
+            opacity: 1;
+          }
+          .bus-marker--sos .bus-marker__sos-ring {
+            display: block;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 80px;
+            height: 80px;
+            transform: translate(-50%, -50%);
+            border: 3px solid #dc2626;
+            border-radius: 50%;
+            animation: sos-pulse 1s ease-in-out infinite;
+            z-index: 3;
+          }
+          @keyframes sos-pulse {
+            0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+            50% { transform: translate(-50%, -50%) scale(1.2); opacity: 0.5; }
+          }
+
+          /* OFFLINE TRANSITION STATE */
+          .bus-marker--offline {
+            opacity: 0;
+            transform: scale(0.8);
+            transition: opacity 0.3s ease, transform 0.3s ease;
           }
           
           /* Main bus body - transit pill style */
@@ -870,6 +1027,7 @@ export default function FullMapScreen({ route }) {
             window.__followBusId = null;
             window.userLocation = null;
             window.__pendingBusStopRender = false;
+            window.__busAnimations = {}; // RAF animation tracking per bus
 
             // 3) PRODUCTION-GRADE BUS MARKER ARCHITECTURE
             // Layered divIcon with DOM mutation-only updates
@@ -878,14 +1036,17 @@ export default function FullMapScreen({ route }) {
             // Build bus marker HTML using string concatenation (no nested template literals)
             function buildBusMarkerHTML(color, shortName) {
               return '<div class="bus-marker" data-bus-id="">' +
+                '<div class="bus-marker__pulse"></div>' +
                 '<div class="bus-marker__glow"></div>' +
-                '<div class="bus-marker__body" style="background: ' + color + ';">' +
-                  '<span class="bus-marker__icon">🚌</span>' +
-                  '<span class="bus-marker__route">' + shortName + '</span>' +
-                '</div>' +
-                '<div class="bus-marker__direction" style="transform: rotate(0deg);">➤</div>' +
-                '<div class="bus-marker__eta-badge" style="display: none;">' +
-                  '<span class="eta-time">--</span>' +
+                '<div class="bus-marker__scale-wrapper">' +
+                  '<div class="bus-marker__body" style="background: ' + color + ';">' +
+                    '<span class="bus-marker__icon">🚌</span>' +
+                    '<span class="bus-marker__route">' + shortName + '</span>' +
+                  '</div>' +
+                  '<div class="bus-marker__direction" style="transform: rotate(0deg);">➤</div>' +
+                  '<div class="bus-marker__eta-badge" style="display: none;">' +
+                    '<span class="eta-time">--</span>' +
+                  '</div>' +
                 '</div>' +
                 '<div class="bus-marker__sos-ring" style="display: none;"></div>' +
               '</div>';
@@ -925,16 +1086,107 @@ export default function FullMapScreen({ route }) {
               return marker.__elements;
             }
             
-            // Update marker position (smooth animation ready)
-            function updateBusPosition(marker, lat, lng) {
-              marker.setLatLng([lat, lng]);
+            // GPS TELEPORT PROTECTION - Skip animation if jump is too large
+            const TELEPORT_THRESHOLD_METERS = 200;
+            
+            function haversineDistance(lat1, lng1, lat2, lng2) {
+              const R = 6371000; // Earth radius in meters
+              const dLat = (lat2 - lat1) * Math.PI / 180;
+              const dLng = (lng2 - lng1) * Math.PI / 180;
+              const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                        Math.sin(dLng/2) * Math.sin(dLng/2);
+              const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+              return R * c;
             }
             
-            // Update heading direction (rotation only)
+            // Cancel existing animation for a bus
+            function cancelBusAnimation(busId) {
+              if (window.__busAnimations[busId]) {
+                cancelAnimationFrame(window.__busAnimations[busId].rafId);
+                delete window.__busAnimations[busId];
+              }
+            }
+            
+            // Smooth marker position animation with teleport protection
+            function animateBusMarker(busId, marker, targetLat, targetLng, duration) {
+              duration = duration || 800; // Default 800ms for smooth transit feel
+              
+              const currentLatLng = marker.getLatLng();
+              const startLat = currentLatLng.lat;
+              const startLng = currentLatLng.lng;
+              
+              // GPS Teleport Protection: Skip animation if distance is too large
+              const distance = haversineDistance(startLat, startLng, targetLat, targetLng);
+              if (distance > TELEPORT_THRESHOLD_METERS) {
+                marker.setLatLng([targetLat, targetLng]);
+                return;
+              }
+              
+              // Cancel any existing animation for this bus
+              cancelBusAnimation(busId);
+              
+              const startTime = performance.now();
+              
+              function step(currentTime) {
+                // Safety guard: stop animation if marker no longer exists (BUS_OFFLINE)
+                if (!window.busMarkers[busId]) {
+                  cancelBusAnimation(busId);
+                  return;
+                }
+
+                const elapsed = currentTime - startTime;
+                const progress = Math.min(elapsed / duration, 1);
+
+                // Easing function: easeOutCubic for natural deceleration
+                const eased = 1 - Math.pow(1 - progress, 3);
+
+                const newLat = startLat + (targetLat - startLat) * eased;
+                const newLng = startLng + (targetLng - startLng) * eased;
+
+                marker.setLatLng([newLat, newLng]);
+                
+                if (progress < 1) {
+                  window.__busAnimations[busId] = {
+                    rafId: requestAnimationFrame(step),
+                    startLat, startLng, targetLat, targetLng
+                  };
+                } else {
+                  delete window.__busAnimations[busId];
+                }
+              }
+              
+              window.__busAnimations[busId] = {
+                rafId: requestAnimationFrame(step),
+                startLat, startLng, targetLat, targetLng
+              };
+            }
+            
+            // Update marker position (with smooth animation)
+            function updateBusPosition(marker, busId, lat, lng) {
+              animateBusMarker(busId, marker, lat, lng, 800);
+            }
+            
+            // Update heading direction with smooth rotation
             function updateBusHeading(marker, heading) {
               const els = getMarkerElements(marker);
               if (els && els.direction && heading !== undefined) {
-                els.direction.style.transform = 'rotate(' + heading + 'deg)';
+                // Normalize heading to 0-360
+                let normalizedHeading = heading % 360;
+                if (normalizedHeading < 0) normalizedHeading += 360;
+                
+                // Get current rotation
+                const currentTransform = els.direction.style.transform || '';
+                const match = currentTransform.match(/rotate\(([-\d.]+)deg\)/);
+                let currentHeading = match ? parseFloat(match[1]) : 0;
+                
+                // Shortest path rotation (handle 350 -> 10 transition)
+                let delta = normalizedHeading - currentHeading;
+                if (delta > 180) delta -= 360;
+                if (delta < -180) delta += 360;
+                
+                const finalHeading = currentHeading + delta;
+                els.direction.style.transform = 'rotate(' + finalHeading + 'deg)';
               }
             }
             
@@ -1041,6 +1293,16 @@ export default function FullMapScreen({ route }) {
 
             // Initialize SOS markers storage (separate from bus markers)
             window.sosMarkers = window.sosMarkers || {};
+
+            // Helper: Reset bus visual state to prevent conflicting classes
+            function resetBusVisualState(markerEl) {
+              if (!markerEl) return;
+              markerEl.classList.remove('bus-marker--moving');
+              markerEl.classList.remove('bus-marker--stopped');
+              markerEl.classList.remove('bus-marker--arriving');
+              markerEl.classList.remove('bus-marker--sos');
+              markerEl.classList.remove('bus-marker--offline');
+            }
 
             // 3a) CREATE POPUP HTML (dynamic follow/unfollow)
             // SPEEDOMETER UPDATE FUNCTION - UI only, no calculations
@@ -1156,9 +1418,13 @@ export default function FullMapScreen({ route }) {
             // 3b) UPDATE BUS POPUP (keeps popup in sync with bus data)
             function updateBusPopup(marker, bus) {
               if (!marker || !marker.getPopup()) return;
-              
-              // Update popup content with latest data
-              marker.setPopupContent(createPopupHTML(bus));
+
+              // Deduplication: only update if content changed
+              const newContent = createPopupHTML(bus);
+              const currentContent = marker.getPopup().getContent();
+              if (newContent !== currentContent) {
+                marker.setPopupContent(newContent);
+              }
               
               // If following this bus, ensure popup stays open
               if (window.__followBusId === (bus.busId || bus.id)) {
@@ -1236,10 +1502,10 @@ export default function FullMapScreen({ route }) {
                   // UPDATE EXISTING MARKER - DOM mutation only, no recreation
                   const marker = markers[id];
                   
-                  // 1. Update position
-                  updateBusPosition(marker, bus.lat, bus.lng);
+                  // 1. Update position (with smooth animation)
+                  updateBusPosition(marker, id, bus.lat, bus.lng);
                   
-                  // 2. Update heading (direction rotation only)
+                  // 2. Update heading (direction rotation only, with smoothing)
                   if (bus.heading !== undefined && bus.heading !== marker.__busData?.heading) {
                     updateBusHeading(marker, bus.heading);
                   }
@@ -1277,23 +1543,48 @@ export default function FullMapScreen({ route }) {
                   if (bus.sos !== marker.__busData?.sos) {
                     updateBusSOS(marker, bus.sos);
                   }
-                  
-                  // 8. Merge data for popup updates
-                  marker.__busData = { ...marker.__busData, ...bus, id, eta };
-                  
-                  // 9. Update popup content (if open or following)
-                  updateBusPopup(marker, marker.__busData);
-                  
-                  // 10. Update z-index based on state
-                  if (window.__followBusId === id) {
-                    marker.setZIndexOffset(1000);
-                  } else if (bus.sos) {
-                    marker.setZIndexOffset(2000);
-                  } else {
-                    marker.setZIndexOffset(0);
+
+                  // 8. Apply visual state classes based on bus conditions
+                  const els = getMarkerElements(marker);
+                  if (els && els.container) {
+                    resetBusVisualState(els.container);
+
+                    const speedKmh = bus.speed || 0;
+                    const remainingDistance = bus.progression?.remainingDistanceKm || Infinity;
+                    const isSos = bus.sos === true;
+
+                    // Priority: SOS > Arriving > Moving > Stopped
+                    if (isSos) {
+                      els.container.classList.add('bus-marker--sos');
+                    } else if (remainingDistance < 0.2) {
+                      els.container.classList.add('bus-marker--arriving');
+                    } else if (speedKmh > 5) {
+                      els.container.classList.add('bus-marker--moving');
+                    } else {
+                      els.container.classList.add('bus-marker--stopped');
+                    }
                   }
-                  
-                  // 11. Event-driven follow: camera tracks bus
+
+                  // 9. Merge data for popup updates
+                  marker.__busData = { ...marker.__busData, ...bus, id, eta };
+
+                  // 10. Update popup content (if open or following)
+                  updateBusPopup(marker, marker.__busData);
+
+                  // 11. Update z-index based on marker hierarchy
+                  // Hierarchy: Followed bus > Arriving > SOS > Normal buses > Stops > Corridor
+                  const remainingDistance = bus.progression?.remainingDistanceKm || Infinity;
+                  if (window.__followBusId === id) {
+                    marker.setZIndexOffset(2000); // Highest priority
+                  } else if (remainingDistance < 0.2) {
+                    marker.setZIndexOffset(1800); // Arriving priority
+                  } else if (bus.sos) {
+                    marker.setZIndexOffset(1500); // Emergency priority
+                  } else {
+                    marker.setZIndexOffset(1000); // Normal bus priority
+                  }
+
+                  // 12. Event-driven follow: camera tracks bus
                   if (window.__followBusId === id && !window.__isUserInteracting) {
                     throttledFollow(bus.lat, bus.lng);
                   }
@@ -1319,6 +1610,25 @@ export default function FullMapScreen({ route }) {
                   }
                   if (bus.sos) {
                     updateBusSOS(marker, true);
+                  }
+
+                  // Apply initial visual state class
+                  const els = getMarkerElements(marker);
+                  if (els && els.container) {
+                    const speedKmh = bus.speed || 0;
+                    const remainingDistance = bus.progression?.remainingDistanceKm || Infinity;
+                    const isSos = bus.sos === true;
+
+                    // Priority: SOS > Arriving > Moving > Stopped
+                    if (isSos) {
+                      els.container.classList.add('bus-marker--sos');
+                    } else if (remainingDistance < 0.2) {
+                      els.container.classList.add('bus-marker--arriving');
+                    } else if (speedKmh > 5) {
+                      els.container.classList.add('bus-marker--moving');
+                    } else {
+                      els.container.classList.add('bus-marker--stopped');
+                    }
                   }
                   
                   // Show speed badge if this bus is already being followed
@@ -1349,9 +1659,16 @@ export default function FullMapScreen({ route }) {
                     closeOnClick: false
                   });
 
-                  // Set initial z-index
-                  if (bus.sos) {
-                    marker.setZIndexOffset(2000);
+                  // Set initial z-index based on hierarchy
+                  const remainingDistance = bus.progression?.remainingDistanceKm || Infinity;
+                  if (window.__followBusId === id) {
+                    marker.setZIndexOffset(2000); // Highest priority
+                  } else if (remainingDistance < 0.2) {
+                    marker.setZIndexOffset(1800); // Arriving priority
+                  } else if (bus.sos) {
+                    marker.setZIndexOffset(1500); // Emergency priority
+                  } else {
+                    marker.setZIndexOffset(1000); // Normal bus priority
                   }
 
                   markers[id] = marker;
@@ -1437,6 +1754,19 @@ function createStopIcon(name) {
     html: '<div class="bus-stop-marker">' +
       '<div class="bus-stop-icon">🛑</div>' +
       '<div class="bus-stop-label">' + (name || 'Stop') + '</div>' +
+      '</div>',
+    className: '',
+    iconSize: [80, 60],
+    iconAnchor: [40, 60]
+  });
+}
+
+// Passed stop icon - dimmed appearance
+function createPassedStopIcon(name) {
+  return L.divIcon({
+    html: '<div class="bus-stop-marker passed-stop">' +
+      '<div class="bus-stop-icon" style="background: #e5e7eb; border-color: #9ca3af; color: #6b7280;">✓</div>' +
+      '<div class="bus-stop-label" style="background: #e5e7eb; color: #6b7280;">' + (name || 'Stop') + '</div>' +
       '</div>',
     className: '',
     iconSize: [80, 60],
@@ -1594,7 +1924,7 @@ async function drawRouteToStop(userLat, userLng, stopLat, stopLng) {
     window.__focusRouteLayer = L.polyline(coords, {
       color: '#007AFF',
       weight: 5,
-      opacity: 0.9,
+      opacity: 0.35,
       dashArray: '10, 10'
     }).addTo(window.map);
     
@@ -1818,6 +2148,7 @@ function drawStraightLine(lat, lng, nearest) {
     {
       color: '#007AFF',
       weight: 4,
+      opacity: 0.35,
       dashArray: '8, 8'
     }
   ).addTo(window.map);
@@ -1862,7 +2193,7 @@ async function updateNearestRoute(lat, lng) {
     window.__nearestRouteLayer = L.polyline(route, {
       color: '#007AFF',
       weight: 5,
-      opacity: 0.9
+      opacity: 0.35
     }).addTo(window.map);
 
     console.log("[WEBVIEW] OSRM route drawn");
@@ -1873,6 +2204,7 @@ async function updateNearestRoute(lat, lng) {
       {
         color: '#007AFF',
         weight: 4,
+        opacity: 0.35,
         dashArray: '8, 8'
       }
     ).addTo(window.map);
@@ -2072,7 +2404,7 @@ window.map.on("zoomend", function() {
                     const routeLine = L.polyline(data.coordinates, {
                       color: data.routeColor || "#2563eb",
                       weight: 5,
-                      opacity: 0.7,
+                      opacity: 0.35,
                     }).addTo(window.map);
                     
                     window.__activeRouteLine = routeLine;
@@ -2142,26 +2474,84 @@ window.map.on("zoomend", function() {
                   break;
 
                 case "STOP_PROGRESSION": {
-                  const { busId, nextStopIndex, currentStopIndex, etaMinutes } = data;
-                  console.log("[WEBVIEW] STOP_PROGRESSION:", busId, "next:", nextStopIndex);
-                  
-                  // Initialize next stop markers tracking
+                  const { busId, tripId, nextStopIndex, currentStopIndex, passedStopIds, etaMinutes } = data;
+                  console.log("[WEBVIEW] STOP_PROGRESSION:", busId, "trip:", tripId, "next:", nextStopIndex, "passed:", passedStopIds?.length || 0);
+
+                  // Initialize tracking objects
                   if (!window.__nextStopMarkers) window.__nextStopMarkers = {};
+                  if (!window.__passedStopMarkers) window.__passedStopMarkers = {};
+                  if (!window.__busTripIds) window.__busTripIds = {};
+
+                  // Route switch detection: clear all stop state if trip changed
+                  const prevTripId = window.__busTripIds[busId];
+                  if (prevTripId && prevTripId !== tripId) {
+                    console.log("[WEBVIEW] Trip switch detected for", busId, ":", prevTripId, "→", tripId);
+
+                    // Clear passed stop styling
+                    const prevPassed = window.__passedStopMarkers[busId] || [];
+                    prevPassed.forEach(function(stopId) {
+                      if (window.__busStopMarkers[stopId]) {
+                        const marker = window.__busStopMarkers[stopId];
+                        marker.setIcon(createStopIcon(marker.__stopName || 'Stop'));
+                        marker._isPassed = false;
+                      }
+                    });
+                    delete window.__passedStopMarkers[busId];
+
+                    // Clear next stop highlight
+                    const prevNextStop = window.__nextStopMarkers[busId];
+                    if (prevNextStop && window.__busStopMarkers[prevNextStop]) {
+                      const marker = window.__busStopMarkers[prevNextStop];
+                      marker.setIcon(createStopIcon(marker.__stopName || 'Stop'));
+                    }
+                    delete window.__nextStopMarkers[busId];
+                  }
+
+                  // Update stored tripId
+                  window.__busTripIds[busId] = tripId;
                   
-                  // Remove previous highlight for this bus
+                  // 1. Restore previous passed stops for this bus
+                  const prevPassed = window.__passedStopMarkers[busId] || [];
+                  prevPassed.forEach(function(stopId) {
+                    if (window.__busStopMarkers[stopId]) {
+                      const marker = window.__busStopMarkers[stopId];
+                      // Restore to default stop icon (not passed, not highlighted)
+                      marker.setIcon(createStopIcon(marker.__stopName || 'Stop'));
+                      marker._isPassed = false;
+                    }
+                  });
+                  
+                  // 2. Remove previous next-stop highlight for this bus
                   const prevHighlight = window.__nextStopMarkers[busId];
                   if (prevHighlight && window.__busStopMarkers[prevHighlight]) {
                     const marker = window.__busStopMarkers[prevHighlight];
-                    marker.setIcon(createStopIcon(marker.__stopName || 'Stop'));
+                    // Only restore if NOT in new passed list
+                    if (!passedStopIds || !passedStopIds.includes(prevHighlight)) {
+                      marker.setIcon(createStopIcon(marker.__stopName || 'Stop'));
+                    }
                     console.log("[WEBVIEW] Removed previous highlight for", busId);
                   }
                   
-                  // Highlight new next stop
+                  // 3. Apply passed-stop styling
+                  const currentPassed = [];
+                  if (passedStopIds && passedStopIds.length > 0) {
+                    passedStopIds.forEach(function(stopId) {
+                      if (window.__busStopMarkers[stopId]) {
+                        const marker = window.__busStopMarkers[stopId];
+                        marker.setIcon(createPassedStopIcon(marker.__stopName || 'Stop'));
+                        marker._isPassed = true;
+                        currentPassed.push(stopId);
+                      }
+                    });
+                  }
+                  window.__passedStopMarkers[busId] = currentPassed;
+                  
+                  // 4. Highlight new next stop (unless it's in passed list)
                   if (nextStopIndex >= 0 && window.__busStops && window.__busStops[nextStopIndex]) {
                     const stop = window.__busStops[nextStopIndex];
                     const stopId = stop.id;
                     
-                    if (window.__busStopMarkers[stopId]) {
+                    if (window.__busStopMarkers[stopId] && !window.__busStopMarkers[stopId]._isPassed) {
                       const marker = window.__busStopMarkers[stopId];
                       marker.setIcon(createHighlightedStopIcon(marker.__stopName || 'Stop', etaMinutes));
                       window.__nextStopMarkers[busId] = stopId;
@@ -2336,12 +2726,45 @@ window.map.on("zoomend", function() {
                   break;
 
                 case "BUS_OFFLINE":
-                  // Remove marker for offline bus
+                  // Cancel any ongoing animation for offline bus
+                  cancelBusAnimation(data.busId);
+
+                  // Apply offline transition before removal
                   if (data.busId && window.busMarkers[data.busId]) {
                     const marker = window.busMarkers[data.busId];
-                    window.map.removeLayer(marker);
-                    delete window.busMarkers[data.busId];
-                    console.log("[WEBVIEW] Removed marker for offline bus:", data.busId);
+                    const els = getMarkerElements(marker);
+
+                    if (els && els.container) {
+                      els.container.classList.add('bus-marker--offline');
+                      console.log("[WEBVIEW] Applied offline transition to:", data.busId);
+
+                      // Remove marker after 300ms transition
+                      setTimeout(function() {
+                        if (window.busMarkers[data.busId]) {
+                          window.map.removeLayer(marker);
+                          delete window.busMarkers[data.busId];
+                          console.log("[WEBVIEW] Removed marker for offline bus:", data.busId);
+                        }
+                      }, 300);
+                    } else {
+                      // Fallback: remove immediately if no DOM refs
+                      window.map.removeLayer(marker);
+                      delete window.busMarkers[data.busId];
+                      console.log("[WEBVIEW] Removed marker for offline bus (fallback):", data.busId);
+                    }
+                  }
+                  // Clear passed stop styling for offline bus
+                  if (data.busId && window.__passedStopMarkers?.[data.busId]) {
+                    const prevPassed = window.__passedStopMarkers[data.busId];
+                    prevPassed.forEach(function(stopId) {
+                      if (window.__busStopMarkers[stopId]) {
+                        const marker = window.__busStopMarkers[stopId];
+                        marker.setIcon(createStopIcon(marker.__stopName || 'Stop'));
+                        marker._isPassed = false;
+                      }
+                    });
+                    delete window.__passedStopMarkers[data.busId];
+                    console.log("[WEBVIEW] Removed passed stop styling for offline bus:", data.busId, "count:", prevPassed.length);
                   }
                   // Clear next stop highlight for offline bus
                   if (data.busId && window.__nextStopMarkers?.[data.busId]) {
