@@ -294,6 +294,7 @@ export default function DriverTrackingScreen({
   const networkCheckIntervalRef = useRef(null);
   const flushInProgressRef = useRef(false);
   const guaranteeTimeoutRef = useRef(null);
+  const trackingStartInFlightRef = useRef(false); // Prevent duplicate tracking starts
 
   // Calculate distance between two coordinates (Haversine formula)
   const calculateDistance = (lat1, lng1, lat2, lng2) => {
@@ -750,8 +751,16 @@ export default function DriverTrackingScreen({
 
   // Start tracking with watchPositionAsync
   const startTracking = async () => {
+    // Fix #1: Prevent duplicate tracking starts
+    if (trackingStartInFlightRef.current) {
+      console.log("[TRACKING] Start blocked - already starting");
+      return;
+    }
+    trackingStartInFlightRef.current = true;
+
     if (locationSubscriptionRef.current) {
       console.log("[TRACKING] Already running");
+      trackingStartInFlightRef.current = false;
       return;
     }
 
@@ -835,6 +844,9 @@ export default function DriverTrackingScreen({
     } catch (err) {
       console.log("[TRACKING] Start error:", err.message);
       setStatus("GPS error: " + err.message);
+    } finally {
+      // Fix #1: Reset in-flight flag
+      trackingStartInFlightRef.current = false;
     }
   };
 

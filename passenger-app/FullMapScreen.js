@@ -835,6 +835,20 @@ export default function FullMapScreen({ route }) {
             background: radial-gradient(circle, rgba(220,38,38,0.6) 0%, transparent 70%);
             opacity: 1;
           }
+
+          /* SOS + FOLLOW MERGED STATE - prevent transform conflicts */
+          .bus-marker--followed.bus-marker--sos .bus-marker__scale-wrapper {
+            transform: translate(-50%, -50%) scale(1.25); /* Controlled combined scale */
+          }
+          .bus-marker--followed.bus-marker--sos .bus-marker__pulse {
+            animation-duration: 0.6s; /* Faster SOS pulse takes precedence */
+            border-color: rgba(220,38,38,1);
+            border-width: 3px;
+          }
+          .bus-marker--followed.bus-marker--sos .bus-marker__glow {
+            background: radial-gradient(circle, rgba(220,38,38,0.7) 0%, rgba(0,122,255,0.3) 70%, transparent 100%);
+            opacity: 1;
+          }
           .bus-marker--sos .bus-marker__sos-ring {
             display: block;
             position: absolute;
@@ -1294,6 +1308,9 @@ export default function FullMapScreen({ route }) {
             // Initialize SOS markers storage (separate from bus markers)
             window.sosMarkers = window.sosMarkers || {};
 
+            // Track pending offline removal timeouts to prevent race conditions
+            window.__offlineTimeouts = window.__offlineTimeouts || {};
+
             // Helper: Reset bus visual state to prevent conflicting classes
             function resetBusVisualState(markerEl) {
               if (!markerEl) return;
@@ -1501,6 +1518,13 @@ export default function FullMapScreen({ route }) {
                 if (markers[id]) {
                   // UPDATE EXISTING MARKER - DOM mutation only, no recreation
                   const marker = markers[id];
+
+                  // Fix #4: Cancel pending offline timeout if bus comes back online
+                  if (window.__offlineTimeouts[id]) {
+                    clearTimeout(window.__offlineTimeouts[id]);
+                    delete window.__offlineTimeouts[id];
+                    console.log("[WEBVIEW] Cancelled offline timeout for revived bus:", id);
+                  }
                   
                   // 1. Update position (with smooth animation)
                   updateBusPosition(marker, id, bus.lat, bus.lng);
@@ -1547,9 +1571,12 @@ export default function FullMapScreen({ route }) {
                   // 8. Apply visual state classes based on bus conditions
                   const els = getMarkerElements(marker);
                   if (els && els.container) {
+                    // Fix #4: Remove offline class before applying new states
+                    els.container.classList.remove('bus-marker--offline');
                     resetBusVisualState(els.container);
 
-                    const speedKmh = bus.speed || 0;
+                    // Fix #3: Use backend-derived speed for reliable movement detection
+                    const speedKmh = bus.derivedSpeed !== undefined ? bus.derivedSpeed : (bus.speed || 0);
                     const remainingDistance = bus.progression?.remainingDistanceKm || Infinity;
                     const isSos = bus.sos === true;
 
@@ -1615,7 +1642,8 @@ export default function FullMapScreen({ route }) {
                   // Apply initial visual state class
                   const els = getMarkerElements(marker);
                   if (els && els.container) {
-                    const speedKmh = bus.speed || 0;
+                    // Fix #3: Use backend-derived speed for reliable movement detection
+                    const speedKmh = bus.derivedSpeed !== undefined ? bus.derivedSpeed : (bus.speed || 0);
                     const remainingDistance = bus.progression?.remainingDistanceKm || Infinity;
                     const isSos = bus.sos === true;
 
@@ -2729,6 +2757,13 @@ window.map.on("zoomend", function() {
                   // Cancel any ongoing animation for offline bus
                   cancelBusAnimation(data.busId);
 
+                  // Clear any pending offline timeout for this bus
+                  if (window.__offlineTimeouts[data.busId]) {
+                    clearTimeout(window.__offlineTimeouts[data.busId]);
+                    delete window.__offlineTimeouts[data.busId];
+                    console.log("[WEBVIEW] Cleared pending offline timeout for:", data.busId);
+                  }
+
                   // Apply offline transition before removal
                   if (data.busId && window.busMarkers[data.busId]) {
                     const marker = window.busMarkers[data.busId];
@@ -2738,14 +2773,26 @@ window.map.on("zoomend", function() {
                       els.container.classList.add('bus-marker--offline');
                       console.log("[WEBVIEW] Applied offline transition to:", data.busId);
 
+                      // Fix #3: Capture target marker identity for timeout callback
+                      const targetMarker = marker;
+
                       // Remove marker after 300ms transition
-                      setTimeout(function() {
-                        if (window.busMarkers[data.busId]) {
-                          window.map.removeLayer(marker);
+                      const timeoutId = setTimeout(function() {
+                        // Fix #3: Verify marker identity matches (not just existence)
+                        // Prevents deletion of fresh marker after reconnect
+                        if (window.busMarkers[data.busId] === targetMarker) {
+                          window.map.removeLayer(targetMarker);
                           delete window.busMarkers[data.busId];
                           console.log("[WEBVIEW] Removed marker for offline bus:", data.busId);
+                        } else {
+                          console.log("[WEBVIEW] Skipped removal - marker identity changed (reconnect):", data.busId);
+                        }
+                        // Cleanup timeout ref
+                        if (window.__offlineTimeouts[data.busId] === timeoutId) {
+                          delete window.__offlineTimeouts[data.busId];
                         }
                       }, 300);
+                      window.__offlineTimeouts[data.busId] = timeoutId;
                     } else {
                       // Fallback: remove immediately if no DOM refs
                       window.map.removeLayer(marker);
