@@ -977,6 +977,7 @@ export default function FullMapScreen({ route }) {
 window.__busStopMarkers = {};
 window.__stopBusMap = {}; // stopId → [busIds]
 window.__highlightedStopId = null; // Currently highlighted stop
+window.__activeRouteStopId = null; // Persist route highlight across re-renders
 window.__lastNearestDistance = Infinity; // For hysteresis
 window.__nearestStopMarker = null; // Direct reference to nearest stop marker
 window.__nearestStopData = null; // Stop data for nearest stop
@@ -1481,6 +1482,19 @@ window.map.on("zoomend", function() {
                       if (window.map) renderBusStops();
                     }, 300);
                   }
+
+                  // Re-apply route highlight after stops are rendered
+                  if (window.__activeRouteStopId) {
+                    setTimeout(function() {
+                      if (window.__busStopMarkers[window.__activeRouteStopId]) {
+                        const marker = window.__busStopMarkers[window.__activeRouteStopId];
+                        const stopName = marker.__stopName || 'Stop';
+                        marker.setIcon(createHighlightedStopIcon(stopName));
+                        window.__highlightedStopId = window.__activeRouteStopId;
+                        console.log("[WEBVIEW] INIT_BUS_STOPS: re-applied route highlight for", window.__activeRouteStopId);
+                      }
+                    }, 350); // After renderBusStops completes
+                  }
                   break;
 
                 case "BUS_UPDATE":
@@ -1518,6 +1532,42 @@ window.map.on("zoomend", function() {
                     }
                   } else {
                     console.error("[WEBVIEW] Missing lat/lng in payload:", data.payload);
+                  }
+                  break;
+
+                case "DRAW_ROUTE":
+                  // Store route stop ID for persistent highlighting
+                  if (data.stopId) {
+                    window.__activeRouteStopId = data.stopId;
+                    // Apply highlight immediately if marker exists
+                    if (window.__busStopMarkers[data.stopId]) {
+                      const marker = window.__busStopMarkers[data.stopId];
+                      if (window.__highlightedStopId && window.__highlightedStopId !== data.stopId) {
+                        const prev = window.__busStopMarkers[window.__highlightedStopId];
+                        if (prev) {
+                          const prevStopName = prev.__stopName || 'Stop';
+                          prev.setIcon(createStopIcon(prevStopName));
+                        }
+                      }
+                      const stopName = marker.__stopName || 'Stop';
+                      marker.setIcon(createHighlightedStopIcon(stopName));
+                      window.__highlightedStopId = data.stopId;
+                      console.log("[WEBVIEW] DRAW_ROUTE: highlighted stop", data.stopId);
+                    }
+                  }
+                  break;
+
+                case "CLEAR_ROUTE":
+                  // Clear route highlight
+                  if (window.__activeRouteStopId) {
+                    if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
+                      const marker = window.__busStopMarkers[window.__highlightedStopId];
+                      const stopName = marker.__stopName || 'Stop';
+                      marker.setIcon(createStopIcon(stopName));
+                    }
+                    window.__highlightedStopId = null;
+                    window.__activeRouteStopId = null;
+                    console.log("[WEBVIEW] CLEAR_ROUTE: highlight cleared");
                   }
                   break;
 
@@ -1822,15 +1872,26 @@ window.map.on("zoomend", function() {
             }
             window.map.whenReady(function() {
               console.log("[WEBVIEW] Map is ready");
-              
-              // Process any pending bus stop render
-              if (window.__pendingBusStopRender && window.__busStops && window.__busStops.length) {
-                console.log("[WEBVIEW] Processing pending bus stop render");
-                window.__pendingBusStopRender = false;
+              // Initial render only
+              if (window.__busStops && window.__busStops.length > 0) {
+                console.log("[WEBVIEW] Calling renderBusStops after map ready");
                 if (window.renderBusStops) window.renderBusStops();
               }
               
               sendMapReady();
+              
+              // Re-apply route highlight after map is ready
+              if (window.__activeRouteStopId) {
+                setTimeout(function() {
+                  if (window.__busStopMarkers[window.__activeRouteStopId]) {
+                    const marker = window.__busStopMarkers[window.__activeRouteStopId];
+                    const stopName = marker.__stopName || 'Stop';
+                    marker.setIcon(createHighlightedStopIcon(stopName));
+                    window.__highlightedStopId = window.__activeRouteStopId;
+                    console.log("[WEBVIEW] MAP_READY: re-applied route highlight for", window.__activeRouteStopId);
+                  }
+                }, 400); // After sendMapReady and renderBusStops
+              }
             });
             setTimeout(() => { if (!window.__MAP_READY_SENT__) sendMapReady(); }, 1000);
 

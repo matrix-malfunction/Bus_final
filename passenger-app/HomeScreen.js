@@ -249,6 +249,9 @@ document.addEventListener("DOMContentLoaded", function() {
     // Initialize bus stop markers storage
     window.__busStopMarkers = window.__busStopMarkers || {};
     
+    // Track highlighted stop for route display
+    window.__highlightedStopId = null;
+    
     // Haversine distance formula
     function haversine(lat1, lng1, lat2, lng2) {
       const R = 6371000; // Earth radius in meters
@@ -346,6 +349,99 @@ document.addEventListener("DOMContentLoaded", function() {
       return nearest;
     }
     
+    // Icon definitions for bus stop highlighting
+    const defaultIcon = L.divIcon({
+      className: "bus-stop-marker",
+      html: '<div class="stop-dot"></div>',
+      iconSize: [24, 24],
+      iconAnchor: [12, 12]
+    });
+    
+    const highlightIcon = L.divIcon({
+      className: "bus-stop-marker highlighted",
+      html: '<div class="stop-dot" style="background-color: #FF6B00; transform: scale(1.3);"></div>',
+      iconSize: [32, 32],
+      iconAnchor: [16, 16]
+    });
+    
+    // Highlight a specific stop (for route display)
+    function highlightStop(stopId) {
+      // Early return if already highlighted
+      if (window.__highlightedStopId === stopId) return;
+      
+      const marker = window.__busStopMarkers[stopId];
+      if (!marker) {
+        console.log("[WEBVIEW] highlightStop: marker not found for " + stopId);
+        return;
+      }
+      
+      // Clear previous highlight
+      if (window.__highlightedStopId) {
+        const prev = window.__busStopMarkers[window.__highlightedStopId];
+        if (prev) {
+          prev.setIcon(defaultIcon);
+          prev.setZIndexOffset(1000);
+        }
+      }
+      
+      // Apply highlight
+      marker.setIcon(highlightIcon);
+      marker.setZIndexOffset(2000);
+      
+      window.__highlightedStopId = stopId;
+      console.log("[WEBVIEW] highlightStop: highlighted " + stopId);
+    }
+    
+    // Clear stop highlight
+    function clearHighlight() {
+      if (!window.__highlightedStopId) return;
+      
+      const marker = window.__busStopMarkers[window.__highlightedStopId];
+      if (marker) {
+        marker.setIcon(defaultIcon);
+        marker.setZIndexOffset(0);
+      }
+      
+      console.log("[WEBVIEW] clearHighlight: cleared " + window.__highlightedStopId);
+      window.__highlightedStopId = null;
+    }
+    
+    // Try to compute nearest stops when both location and markers are ready
+    function tryComputeNearestStops() {
+      const hasLocation = window.__lastUserLocation && 
+                        typeof window.__lastUserLocation.lat === 'number' && 
+                        typeof window.__lastUserLocation.lng === 'number';
+      const markerCount = window.__busStopMarkers ? Object.keys(window.__busStopMarkers).length : 0;
+      const hasMarkers = markerCount > 0;
+      
+      console.log("[WEBVIEW] tryComputeNearestStops: hasLocation=" + hasLocation + ", markerCount=" + markerCount);
+      
+      if (!hasLocation) {
+        console.log("[WEBVIEW] tryComputeNearestStops: SKIPPED - no user location");
+        return;
+      }
+      
+      if (!hasMarkers) {
+        console.log("[WEBVIEW] tryComputeNearestStops: SKIPPED - no markers");
+        return;
+      }
+      
+      const { lat, lng } = window.__lastUserLocation;
+      console.log("[WEBVIEW] tryComputeNearestStops: COMPUTING for location", lat.toFixed(5), lng.toFixed(5));
+      
+      const nearestStops = computeNearestStops(lat, lng);
+      
+      if (nearestStops.length > 0) {
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: "NEAREST_STOPS",
+          stops: nearestStops
+        }));
+        console.log("[WEBVIEW] tryComputeNearestStops: SENT " + nearestStops.length + " stops");
+      } else {
+        console.log("[WEBVIEW] tryComputeNearestStops: no nearest stops found");
+      }
+    }
+    
     function updateUserLocation(lat, lng) {
       // Validate map is a valid Leaflet instance
       if (!window.map || typeof window.map.addLayer !== "function") {
@@ -396,14 +492,8 @@ document.addEventListener("DOMContentLoaded", function() {
         
         send("USER MARKER CREATED: " + lat.toFixed(6) + ", " + lng.toFixed(6));
         
-        // Compute and send nearest stops
-        const nearestStops = computeNearestStops(lat, lng);
-        if (nearestStops.length > 0) {
-          window.ReactNativeWebView.postMessage(JSON.stringify({
-            type: "NEAREST_STOPS",
-            stops: nearestStops
-          }));
-        }
+        // Try to compute nearest stops (will check both location and markers)
+        tryComputeNearestStops();
         
         // NO EARLY RETURN - continue to setLatLng below
       }
@@ -414,15 +504,8 @@ document.addEventListener("DOMContentLoaded", function() {
         send("USER LOCATION UPDATED: " + lat.toFixed(6) + ", " + lng.toFixed(6));
       }
       
-      // Compute and send nearest stops to React Native
-      const nearestStops = computeNearestStops(lat, lng);
-      if (nearestStops.length > 0) {
-        window.ReactNativeWebView.postMessage(JSON.stringify({
-          type: "NEAREST_STOPS",
-          stops: nearestStops
-        }));
-        send("NEAREST_STOPS sent: " + nearestStops.length + " stops");
-      }
+      // Try to compute nearest stops after location update
+      tryComputeNearestStops();
     }
     
     // Process queued messages - ALWAYS run
@@ -719,21 +802,23 @@ document.addEventListener("DOMContentLoaded", function() {
                       '</div>'
                     );
                   }
+                  // Preserve highlight state during sync
+                  const isHighlighted = stop.id === window.__highlightedStopId;
+                  existingMarker.setIcon(isHighlighted ? highlightIcon : defaultIcon);
+                  existingMarker.setZIndexOffset(isHighlighted ? 2000 : 1000);
                   return;
                 }
                 
+                // Check if this new marker should be highlighted
+                const isHighlighted = stop.id === window.__highlightedStopId;
+                
                 // Create new marker with divIcon (like FullMap)
                 const marker = L.marker([stop.lat, stop.lng], {
-                  icon: L.divIcon({
-                    className: "bus-stop-marker",
-                    html: '<div class="stop-dot"></div>',
-                    iconSize: [24, 24],
-                    iconAnchor: [12, 12]
-                  })
+                  icon: isHighlighted ? highlightIcon : defaultIcon
                 }).addTo(window.map);
                 
-                // Ensure markers are above tiles
-                marker.setZIndexOffset(1000);
+                // Ensure markers are above tiles (higher z-index if highlighted)
+                marker.setZIndexOffset(isHighlighted ? 2000 : 1000);
                 
                 // Add popup with detailed info
                 marker.bindPopup(
@@ -786,6 +871,9 @@ document.addEventListener("DOMContentLoaded", function() {
                 window.map.setView([12.92, 79.13], 13);
                 send(msgType + " fallback center applied (no bounds)");
               }
+              
+              // Try to compute nearest stops after markers are synced
+              tryComputeNearestStops();
             }, 300); // CRITICAL: prevents race condition with map init
             break;
 
@@ -820,6 +908,11 @@ document.addEventListener("DOMContentLoaded", function() {
               opacity: 0.9
             }).addTo(window.map);
             
+            // Highlight the destination stop if provided
+            if (data.stopId) {
+              highlightStop(data.stopId);
+            }
+            
             send("DRAW_ROUTE rendered: " + data.coords.length + " points");
             break;
 
@@ -830,6 +923,8 @@ document.addEventListener("DOMContentLoaded", function() {
               window.map.removeLayer(window.__routeLayer);
               window.__routeLayer = null;
             }
+            // Clear stop highlight
+            clearHighlight();
             send("Route cleared");
             break;
 
@@ -944,7 +1039,7 @@ const HomeScreen = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [userLocation, setUserLocation] = useState(DEFAULT_CENTER);
   const [showNearestRoute, setShowNearestRoute] = useState(false);
-  const [nearestStops, setNearestStops] = useState([]);
+  const [nearestStops, setNearestStops] = useState(null); // null=loading, []=no stops, [data]=valid
   const { buses, socket, busStops } = useBus();
   
   // Local follow state (single source of truth for this screen)
@@ -1003,8 +1098,11 @@ const HomeScreen = () => {
 
       case "NEAREST_STOPS":
         console.log("[RN MiniMap] NEAREST_STOPS received:", data.stops?.length);
+        // Always update to reflect latest WebView computation
+        // 3-state model: null=loading, []=no stops, [data]=valid
         if (Array.isArray(data.stops)) {
           setNearestStops(data.stops);
+          console.log("[RN MiniMap] nearestStops updated:", data.stops.length, "stops");
         }
         break;
 
@@ -1442,12 +1540,14 @@ const HomeScreen = () => {
           <Text style={styles.nearbyStopsTitle}>Nearby Stops</Text>
           
           {(() => {
-            console.log("nearestStops:", nearestStops);
+            console.log("[RN] nearestStops:", nearestStops === null ? "loading" : nearestStops.length);
             return null;
           })()}
           
-          {nearestStops.length === 0 ? (
+          {nearestStops === null ? (
             <Text style={styles.nearbyStopDetails}>Loading nearby stops...</Text>
+          ) : nearestStops.length === 0 ? (
+            <Text style={styles.nearbyStopDetails}>No nearby stops found</Text>
           ) : (
             nearestStops.map((stop, index) => (
               <TouchableOpacity key={stop.id || index} style={styles.nearbyStopCard}>
