@@ -44,6 +44,7 @@ export function BusProvider({ children }) {
   const [socket, setSocket] = useState(null);
   const [followBusId, setFollowBusId] = useState(null);
   const [userLocation, setUserLocation] = useState(null);
+  const [busStops, setBusStops] = useState([]); // Will be populated from socket
 
   useEffect(() => {
     const newSocket = io(API_BASE_URL);
@@ -90,6 +91,15 @@ export function BusProvider({ children }) {
       setFollowBusId(prev => (prev === busId ? null : prev));
     });
 
+    // Listen for full bus stops dataset from backend
+    newSocket.on("INIT_BUS_STOPS", (data) => {
+      console.log("[BusContext] INIT_BUS_STOPS received:", data?.stops?.length);
+      if (data?.stops && Array.isArray(data.stops)) {
+        setBusStops(data.stops);
+        console.log("[BusContext] busStops updated:", data.stops.length);
+      }
+    });
+
     return () => {
       newSocket.disconnect();
     };
@@ -104,7 +114,7 @@ export function BusProvider({ children }) {
     setFollowBusId,
     userLocation,
     setUserLocation,
-    busStops: STATIC_STOPS
+    busStops // Now from socket, not hardcoded
   };
 
   return <BusContext.Provider value={value}>{children}</BusContext.Provider>;

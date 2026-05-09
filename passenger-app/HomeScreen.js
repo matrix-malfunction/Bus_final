@@ -36,7 +36,7 @@ const BusStopCard = ({ stopName, distance, nextBusTime, onPress }) => (
 );
 
 // Mini Map Component - VIEW ONLY
-const MiniMap = React.memo(({ webViewRef, setWebViewReady, onPress, buses, userLocation, followBusId, setFollowBusId, busStops, showNearestRoute, setShowNearestRoute }) => {
+const MiniMap = React.memo(({ webViewRef, setWebViewReady, onPress, buses, userLocation, followBusId, setFollowBusId, busStops, showNearestRoute, setShowNearestRoute, onMessage }) => {
   const mapHTML = `
 <!DOCTYPE html>
 <html>
@@ -246,6 +246,106 @@ document.addEventListener("DOMContentLoaded", function() {
     // Initialize SOS markers storage (separate from bus markers)
     window.sosMarkers = window.sosMarkers || {};
     
+    // Initialize bus stop markers storage
+    window.__busStopMarkers = window.__busStopMarkers || {};
+    
+    // Haversine distance formula
+    function haversine(lat1, lng1, lat2, lng2) {
+      const R = 6371000; // Earth radius in meters
+      const toRad = Math.PI / 180;
+      const dLat = (lat2 - lat1) * toRad;
+      const dLng = (lng2 - lng1) * toRad;
+      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * toRad) * Math.cos(lat2 * toRad) *
+                Math.sin(dLng / 2) * Math.sin(dLng / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c; // Distance in meters
+    }
+    
+    // Compute nearest 3 stops
+    function computeNearestStops(userLat, userLng) {
+      if (!window.__busStopMarkers || Object.keys(window.__busStopMarkers).length === 0) {
+        console.log("[WEBVIEW] computeNearestStops: no markers available");
+        return [];
+      }
+      
+      const markerIds = Object.keys(window.__busStopMarkers);
+      console.log("[WEBVIEW] computeNearestStops: markers count:", markerIds.length);
+      
+      const stops = [];
+      let skipped = 0;
+      let processed = 0;
+      
+      Object.values(window.__busStopMarkers).forEach(function(marker) {
+        // Validate marker has required properties
+        if (!marker) {
+          skipped++;
+          return;
+        }
+        
+        if (!marker.__stopId) {
+          console.log("[WEBVIEW] Marker missing __stopId, skipping");
+          skipped++;
+          return;
+        }
+        
+        // Safely get LatLng - handle potential errors
+        let stopLat, stopLng;
+        try {
+          const latLng = marker.getLatLng();
+          if (!latLng) {
+            console.log("[WEBVIEW] Marker " + marker.__stopId + " has no LatLng");
+            skipped++;
+            return;
+          }
+          stopLat = latLng.lat;
+          stopLng = latLng.lng;
+          
+          if (typeof stopLat !== 'number' || typeof stopLng !== 'number') {
+            console.log("[WEBVIEW] Marker " + marker.__stopId + " has invalid coordinates");
+            skipped++;
+            return;
+          }
+        } catch (e) {
+          console.error("[WEBVIEW] Error getting LatLng for marker " + marker.__stopId + ":", e.message);
+          skipped++;
+          return;
+        }
+        
+        processed++;
+        const distance = haversine(userLat, userLng, stopLat, stopLng);
+        const etaSeconds = Math.round(distance / 1.4);
+        const etaMinutes = Math.ceil(etaSeconds / 60);
+        
+        let distanceStr;
+        if (distance < 1000) {
+          distanceStr = Math.round(distance) + ' m';
+        } else {
+          distanceStr = (distance / 1000).toFixed(1) + ' km';
+        }
+        
+        stops.push({
+          id: marker.__stopId,
+          name: marker.__stopName || 'Bus Stop',
+          distance: distance,
+          distanceStr: distanceStr,
+          etaMinutes: etaMinutes
+        });
+      });
+      
+      console.log("[WEBVIEW] computeNearestStops: processed " + processed + ", skipped " + skipped + ", found " + stops.length + " valid stops");
+      
+      // Sort by distance ascending
+      stops.sort(function(a, b) {
+        return a.distance - b.distance;
+      });
+      
+      // Return top 3
+      const nearest = stops.slice(0, 3);
+      console.log("[WEBVIEW] computeNearestStops: returning top 3:", nearest.map(s => s.name).join(', '));
+      return nearest;
+    }
+    
     function updateUserLocation(lat, lng) {
       // Validate map is a valid Leaflet instance
       if (!window.map || typeof window.map.addLayer !== "function") {
@@ -295,6 +395,16 @@ document.addEventListener("DOMContentLoaded", function() {
         }
         
         send("USER MARKER CREATED: " + lat.toFixed(6) + ", " + lng.toFixed(6));
+        
+        // Compute and send nearest stops
+        const nearestStops = computeNearestStops(lat, lng);
+        if (nearestStops.length > 0) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({
+            type: "NEAREST_STOPS",
+            stops: nearestStops
+          }));
+        }
+        
         // NO EARLY RETURN - continue to setLatLng below
       }
       
@@ -302,6 +412,16 @@ document.addEventListener("DOMContentLoaded", function() {
       if (window.__userMarker && window.__userMarker.setLatLng) {
         window.__userMarker.setLatLng(pos);
         send("USER LOCATION UPDATED: " + lat.toFixed(6) + ", " + lng.toFixed(6));
+      }
+      
+      // Compute and send nearest stops to React Native
+      const nearestStops = computeNearestStops(lat, lng);
+      if (nearestStops.length > 0) {
+        window.ReactNativeWebView.postMessage(JSON.stringify({
+          type: "NEAREST_STOPS",
+          stops: nearestStops
+        }));
+        send("NEAREST_STOPS sent: " + nearestStops.length + " stops");
       }
     }
     
@@ -526,6 +646,11 @@ document.addEventListener("DOMContentLoaded", function() {
           case "INIT_BUS_STOPS":
             const msgType = data.type;
             send("RECEIVED: " + msgType + " with " + (data.stops?.length || 0) + " stops");
+            
+            // Log custom stops count in WebView
+            const customStops = data.stops?.filter(s => s.id && s.id.startsWith('custom_')) || [];
+            send("CUSTOM STOPS: " + customStops.length);
+            
             if (!window.map) {
               send(msgType + " failed: map not ready");
               return;
@@ -536,19 +661,68 @@ document.addEventListener("DOMContentLoaded", function() {
               window.__busStopMarkers = {};
             }
             
-            // Render bus stops (prevent duplicates, validate structure)
-            if (data.stops && Array.isArray(data.stops) && data.stops.length > 0) {
+            // Render bus stops - update existing, remove stale, add new
+            // CRITICAL: Delay execution to prevent race condition with map initialization
+            setTimeout(() => {
+              if (!window.map) {
+                send("[MAP] Not ready, skipping marker render");
+                return;
+              }
+              
               let added = 0;
+              let updated = 0;
+              let customAdded = 0;
+              let bounds = [];
+              
+              // Track which stop IDs are in the new dataset
+              const newStopIds = new Set(data.stops.map(s => s.id).filter(Boolean));
+              
+              // Remove markers not in new dataset
+              Object.keys(window.__busStopMarkers).forEach(id => {
+                if (!newStopIds.has(id)) {
+                  const marker = window.__busStopMarkers[id];
+                  if (marker && window.map) {
+                    window.map.removeLayer(marker);
+                  }
+                  delete window.__busStopMarkers[id];
+                }
+              });
+              
               data.stops.forEach(stop => {
                 // Validate required fields
                 if (!stop || !stop.id || !stop.lat || !stop.lng) {
                   send("SKIP: invalid stop structure");
                   return;
                 }
-                // Prevent duplicates
-                if (window.__busStopMarkers[stop.id]) return;
                 
-                // Create visible marker with divIcon (like FullMap)
+                // Build bounds from valid coordinates
+                bounds.push([stop.lat, stop.lng]);
+                
+                // Check if marker already exists
+                const existingMarker = window.__busStopMarkers[stop.id];
+                if (existingMarker) {
+                  // Update position if changed
+                  const currentPos = existingMarker.getLatLng();
+                  if (currentPos.lat !== stop.lat || currentPos.lng !== stop.lng) {
+                    existingMarker.setLatLng([stop.lat, stop.lng]);
+                    updated++;
+                  }
+                  // Update name if changed
+                  if (existingMarker.__stopName !== stop.name) {
+                    existingMarker.__stopName = stop.name || "Bus Stop";
+                    // Update popup content
+                    existingMarker.setPopupContent(
+                      '<div style="font-size:12px;">' +
+                        '<strong>' + (stop.name || "Bus Stop") + '</strong><br/>' +
+                        'Lat: ' + stop.lat.toFixed(5) + '<br/>' +
+                        'Lng: ' + stop.lng.toFixed(5) +
+                      '</div>'
+                    );
+                  }
+                  return;
+                }
+                
+                // Create new marker with divIcon (like FullMap)
                 const marker = L.marker([stop.lat, stop.lng], {
                   icon: L.divIcon({
                     className: "bus-stop-marker",
@@ -570,31 +744,49 @@ document.addEventListener("DOMContentLoaded", function() {
                   '</div>'
                 );
                 
+                // Store stop info on marker for nearest stops calculation
+                marker.__stopId = stop.id;
+                marker.__stopName = stop.name || "Bus Stop";
+                
                 window.__busStopMarkers[stop.id] = marker;
                 added++;
-              });
-              
-              // Fit map to show all stops (run once)
-              if (!window.__stopsFitted && Object.keys(window.__busStopMarkers).length > 0) {
-                const markers = Object.values(window.__busStopMarkers);
-                const bounds = markers.map(function(m) { return m.getLatLng(); });
-                window.map.fitBounds(bounds, { padding: [20, 20] });
-                window.__stopsFitted = true;
-                send(msgType + " fitBounds applied");
-              }
-              
-              // Apply initial zoom-based visibility
-              const currentZoom = window.map.getZoom();
-              Object.values(window.__busStopMarkers).forEach(function(marker) {
-                if (currentZoom < 15 && window.map.hasLayer(marker)) {
-                  window.map.removeLayer(marker);
+                
+                // Count custom stops
+                if (stop.id && stop.id.startsWith('custom_')) {
+                  customAdded++;
                 }
               });
               
-              send(msgType + " rendered: " + added + " new, " + Object.keys(window.__busStopMarkers).length + " total");
-            } else {
-              send(msgType + " no stops to render");
-            }
+              const totalMarkers = Object.keys(window.__busStopMarkers).length;
+              send("MARKERS SYNCED: " + added + " added, " + updated + " updated, " + totalMarkers + " total, " + customAdded + " custom");
+              
+              // Apply fitBounds safely with bounds from valid coordinates
+              console.log("[MAP] Bounds count:", bounds.length);
+              
+              if (bounds.length > 0) {
+                try {
+                  const leafletBounds = L.latLngBounds(bounds);
+                  console.log("[MAP] Applying fitBounds");
+                  
+                  window.map.fitBounds(leafletBounds, {
+                    padding: [50, 50],
+                    maxZoom: 15
+                  });
+                  
+                  send(msgType + " fitBounds applied with " + bounds.length + " stops");
+                } catch (e) {
+                  console.error("[MAP] fitBounds failed:", e.message);
+                  // Fallback center
+                  window.map.setView([12.92, 79.13], 13);
+                  send(msgType + " fallback center applied");
+                }
+              } else {
+                console.log("[MAP] No bounds available");
+                // Fallback center (Vellore)
+                window.map.setView([12.92, 79.13], 13);
+                send(msgType + " fallback center applied (no bounds)");
+              }
+            }, 300); // CRITICAL: prevents race condition with map init
             break;
 
           case "DRAW_ROUTE":
@@ -680,75 +872,6 @@ document.addEventListener("DOMContentLoaded", function() {
     busesRef.current = buses;
   }, [buses]);
 
-  // Compute nearest stop, fetch OSRM, and send DRAW_ROUTE
-  useEffect(() => {
-    if (!webViewRef.current) return;
-    
-    if (!showNearestRoute) {
-      // Clear route when disabled
-      webViewRef.current.postMessage(JSON.stringify({
-        type: "CLEAR_ROUTE"
-      }));
-      return;
-    }
-    
-    // Need user location and static stops
-    if (!userLocation || !STATIC_STOPS || STATIC_STOPS.length === 0) {
-      console.log("[RN] Cannot draw route: missing location or stops");
-      return;
-    }
-    
-    // Find nearest stop
-    let nearest = null;
-    let minDistance = Infinity;
-    
-    STATIC_STOPS.forEach(stop => {
-      const dist = Math.sqrt(
-        Math.pow(stop.lat - userLocation.latitude, 2) +
-        Math.pow(stop.lng - userLocation.longitude, 2)
-      );
-      if (dist < minDistance) {
-        minDistance = dist;
-        nearest = stop;
-      }
-    });
-    
-    if (!nearest) {
-      console.log("[RN] No nearest stop found");
-      return;
-    }
-    
-    console.log("[RN] Nearest stop:", nearest.name, "distance:", minDistance);
-    
-    // Fetch OSRM route
-    const osrmUrl = `https://router.project-osrm.org/route/v1/walking/` +
-      `${userLocation.longitude},${userLocation.latitude};` +
-      `${nearest.lng},${nearest.lat}` +
-      `?overview=full&geometries=geojson`;
-    
-    console.log("[RN] Fetching OSRM route...");
-    
-    fetch(osrmUrl)
-      .then(res => res.json())
-      .then(data => {
-        if (data.routes && data.routes.length > 0 && data.routes[0].geometry) {
-          const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
-          
-          // Send DRAW_ROUTE with OSRM coordinates
-          webViewRef.current.postMessage(JSON.stringify({
-            type: "DRAW_ROUTE",
-            coords: coords
-          }));
-          console.log("[RN] DRAW_ROUTE sent with OSRM coords:", coords.length);
-        } else {
-          console.log("[RN] OSRM returned no route");
-        }
-      })
-      .catch(err => {
-        console.log("[RN] OSRM fetch error:", err.message);
-      });
-  }, [showNearestRoute, userLocation]);
-
   // Add refs for bounds debounce
   const boundsDebounceRef = useRef(null);
   const lastBoundsRef = useRef(null);
@@ -762,132 +885,18 @@ document.addEventListener("DOMContentLoaded", function() {
       const data = await response.json();
 
       if (data.success && webViewRef.current) {
-        const mergedStops = mergeStops(data.stops);
         webViewRef.current.postMessage(JSON.stringify({
           type: "INIT_BUS_STOPS",
-          stops: mergedStops
+          stops: data.stops
         }));
-        console.log("[RN] Fetched stops with bounds:", data.count, "merged:", mergedStops.length);
+        console.log("[RN] Fetched stops with bounds:", data.count);
       }
     } catch (error) {
       console.log("[RN] Bounds fetch error:", error.message);
     }
   };
 
-  // Static bus stops (manual coordinates)
-  const STATIC_STOPS = [
-    // VELLORE DISTRICT
-    { id: "vellore_1", name: "Vellore New Bus Station", lat: 12.9346, lng: 79.1366 },
-    { id: "vellore_2", name: "Vellore Old Bus Stand", lat: 12.9223, lng: 79.1325 },
-    { id: "vellore_3", name: "Vellore Smart City Bus Stand", lat: 12.9347, lng: 79.1376 },
-    { id: "vellore_4", name: "CMC Jubilee Gate", lat: 12.9245, lng: 79.1376 },
-    { id: "vellore_5", name: "Vallalar Bus Stop", lat: 12.9383, lng: 79.1669 },
-    { id: "vellore_6", name: "Thottapalayam Bus Stand", lat: 12.9244, lng: 79.1273 },
-    { id: "vellore_7", name: "TNSTC Depot Vellore", lat: 12.9245, lng: 79.1149 },
-    { id: "vellore_8", name: "Sainathapuram Bus Stop", lat: 12.8970, lng: 79.1352 },
-    { id: "vellore_9", name: "Katpadi Bus Stand", lat: 12.9672, lng: 79.1374 },
-    // THIRUVALLUR DISTRICT
-    { id: "tvlr_1", name: "Thiruvallur Bus Stand", lat: 13.1386, lng: 79.9076 },
-    { id: "tvlr_2", name: "Thiruvallur Terminal", lat: 13.1405, lng: 79.9080 },
-    { id: "tvlr_3", name: "Oil Mill Bus Stop", lat: 13.1227, lng: 79.9118 },
-    { id: "tvlr_4", name: "Theradi Bus Stop", lat: 13.1433, lng: 79.9088 },
-    { id: "tvlr_5", name: "Court Bus Stop", lat: 13.1370, lng: 79.9176 },
-    { id: "tvlr_6", name: "Kakkalur Bus Stand", lat: 13.1227, lng: 79.9118 },
-    { id: "tvlr_7", name: "Manavalanagar Bus Stop", lat: 13.1126, lng: 79.9133 },
-    { id: "tvlr_8", name: "Ondikuppam Bus Stop", lat: 13.1104, lng: 79.9180 },
-    { id: "tvlr_9", name: "SBI JN Road Bus Stop", lat: 13.1354, lng: 79.9087 }
-  ];
-
-  // Deduplicate stops by proximity (±0.0005)
-  const mergeStops = (osmStops) => {
-    if (!osmStops || !Array.isArray(osmStops)) return STATIC_STOPS;
-
-    const merged = [...STATIC_STOPS];
-    const proximityThreshold = 0.0005;
-
-    osmStops.forEach(osmStop => {
-      if (!osmStop || !osmStop.lat || !osmStop.lng) return;
-
-      const isDuplicate = merged.some(staticStop => {
-        const latDiff = Math.abs(staticStop.lat - osmStop.lat);
-        const lngDiff = Math.abs(staticStop.lng - osmStop.lng);
-        return latDiff < proximityThreshold && lngDiff < proximityThreshold;
-      });
-
-      if (!isDuplicate) {
-        merged.push(osmStop);
-      }
-    });
-
-    return merged;
-  };
-
-  // Handle messages from WebView - safe switch-based handler
-  const handleWebViewMessage = (event) => {
-    // Debug: Log all raw messages
-    console.log("[RN MiniMap] RAW MESSAGE:", event?.nativeEvent?.data);
-
-    let data;
-
-    try {
-      data = JSON.parse(event.nativeEvent.data);
-    } catch {
-      console.log("[RN MiniMap] Failed to parse message");
-      return;
-    }
-
-    if (!data || !data.type) {
-      console.log("[RN MiniMap] No data or type in message");
-      return;
-    }
-
-    console.log("[RN MiniMap] Parsed type:", data.type);
-
-    switch (data.type) {
-      case "MAP_READY":
-        console.log("[RN MiniMap] MAP_READY received - sending INIT_BUS_STOPS");
-        setWebViewReady(true);
-        
-        // Send INIT_BUS_STOPS when map is ready
-        if (webViewRef.current && STATIC_STOPS?.length > 0) {
-          webViewRef.current.postMessage(JSON.stringify({
-            type: "INIT_BUS_STOPS",
-            stops: STATIC_STOPS
-          }));
-          console.log("[RN MiniMap] INIT_BUS_STOPS sent:", STATIC_STOPS.length);
-        }
-        break;
-
-      case "LOG":
-        console.log("[WEBVIEW]", data.message);
-        break;
-
-      case "SET_FOLLOW":
-        console.log("[RN MiniMap] SET_FOLLOW:", data.busId);
-        setFollowBusId(data.busId || null);
-        break;
-
-      default:
-        console.log("[RN MiniMap] Unknown message type:", data.type);
-    }
-  };
-
-  // Fallback: Send INIT_BUS_STOPS after delay if MAP_READY wasn't received
-  useEffect(() => {
-    if (!webViewRef.current) return;
-
-    const timer = setTimeout(() => {
-      if (webViewRef.current && STATIC_STOPS?.length > 0) {
-        webViewRef.current.postMessage(JSON.stringify({
-          type: "INIT_BUS_STOPS",
-          stops: STATIC_STOPS
-        }));
-        console.log("[RN MiniMap] FALLBACK INIT_BUS_STOPS sent:", STATIC_STOPS.length);
-      }
-    }, 1500);
-
-    return () => clearTimeout(timer);
-  }, []);
+  // Note: No merge needed - backend returns full merged dataset including custom stops
 
   return (
     <View>
@@ -902,7 +911,7 @@ document.addEventListener("DOMContentLoaded", function() {
           allowUniversalAccessFromFileURLs
           allowFileAccessFromFileURLs
           androidLayerType="hardware"
-          onMessage={handleWebViewMessage}
+          onMessage={onMessage}
           source={{ html: mapHTML }}
           style={{ flex: 1 }}
         />
@@ -935,6 +944,7 @@ const HomeScreen = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [userLocation, setUserLocation] = useState(DEFAULT_CENTER);
   const [showNearestRoute, setShowNearestRoute] = useState(false);
+  const [nearestStops, setNearestStops] = useState([]);
   const { buses, socket, busStops } = useBus();
   
   // Local follow state (single source of truth for this screen)
@@ -954,6 +964,54 @@ const HomeScreen = () => {
 
   // Track alerted SOS buses to prevent duplicate alerts
   const alertedSOS = useRef(new Set());
+
+  // Handle messages from WebView - inside component to access state setters
+  const handleWebViewMessage = (event) => {
+    // Debug: Log all raw messages
+    console.log("[RN MiniMap] RAW MESSAGE:", event?.nativeEvent?.data);
+
+    let data;
+
+    try {
+      data = JSON.parse(event.nativeEvent.data);
+    } catch {
+      console.log("[RN MiniMap] Failed to parse message");
+      return;
+    }
+
+    if (!data || !data.type) {
+      console.log("[RN MiniMap] No data or type in message");
+      return;
+    }
+
+    console.log("[RN MiniMap] Parsed type:", data.type);
+
+    switch (data.type) {
+      case "MAP_READY":
+        console.log("[RN MiniMap] MAP_READY received");
+        setWebViewReady(true);
+        break;
+
+      case "LOG":
+        console.log("[WEBVIEW]", data.message);
+        break;
+
+      case "SET_FOLLOW":
+        console.log("[RN MiniMap] SET_FOLLOW:", data.busId);
+        setFollowBusId(data.busId || null);
+        break;
+
+      case "NEAREST_STOPS":
+        console.log("[RN MiniMap] NEAREST_STOPS received:", data.stops?.length);
+        if (Array.isArray(data.stops)) {
+          setNearestStops(data.stops);
+        }
+        break;
+
+      default:
+        break;
+    }
+  };
 
   // Send USER_LOCATION to MiniMap WebView when location changes
   useEffect(() => {
@@ -1099,8 +1157,60 @@ const HomeScreen = () => {
     socket.on("BUS_LOCATION_UPDATE", handleBusLocationUpdate);
     console.log("[RN HomeScreen] BUS_LOCATION_UPDATE listener registered");
 
+    // Listen for INIT_BUS_STOPS from backend (full dataset via socket)
+    const handleInitBusStops = (data) => {
+      console.log("[RN HomeScreen] INIT_BUS_STOPS received:", data?.stops?.length);
+      
+      if (!data || !data.stops || !Array.isArray(data.stops)) {
+        console.log("[RN HomeScreen] INIT_BUS_STOPS: invalid data");
+        return;
+      }
+      
+      // Log custom stops count
+      const customStops = data.stops.filter(s => s.id && s.id.startsWith('custom_'));
+      console.log("[RN HomeScreen] Custom stops from socket:", customStops.length);
+      
+      // Update ref with full dataset from socket
+      busStopsRef.current = data.stops;
+      console.log("[RN HomeScreen] busStopsRef updated with socket data:", data.stops.length);
+      
+      // Send to WebView immediately if ready
+      if (webViewRef.current && webViewReady) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "INIT_BUS_STOPS",
+          stops: data.stops
+        }));
+        console.log("[RN HomeScreen → MiniMap] INIT_BUS_STOPS sent:", data.stops.length);
+      } else {
+        console.log("[RN HomeScreen] WebView not ready, queued for later");
+      }
+    };
+    
+    socket.on("INIT_BUS_STOPS", handleInitBusStops);
+    console.log("[RN HomeScreen] INIT_BUS_STOPS listener registered");
+
+    // Request bus stops explicitly when connected (reliable delivery)
+    const handleConnected = (data) => {
+      console.log("[RN HomeScreen] Socket connected:", data?.socketId);
+      console.log("[RN HomeScreen] Requesting bus stops...");
+      socket.emit("REQUEST_BUS_STOPS");
+    };
+    
+    socket.on("connected", handleConnected);
+    
+    // Also request after a short delay as fallback
+    const requestTimeout = setTimeout(() => {
+      if (socket && socket.connected) {
+        console.log("[RN HomeScreen] Fallback: requesting bus stops");
+        socket.emit("REQUEST_BUS_STOPS");
+      }
+    }, 1000);
+
     return () => {
       socket.off("BUS_LOCATION_UPDATE", handleBusLocationUpdate);
+      socket.off("INIT_BUS_STOPS", handleInitBusStops);
+      socket.off("connected", handleConnected);
+      clearTimeout(requestTimeout);
     };
   }, [socket, webViewReady]);
 
@@ -1121,17 +1231,21 @@ const HomeScreen = () => {
         const data = await response.json();
 
         if (data.success && data.stops) {
-          const mergedStops = mergeStops(data.stops);
-          console.log("[RN] Fetched bus stops:", data.count, "merged:", mergedStops.length);
+          // Use data.stops directly - backend already returns merged dataset
+          console.log("[RN] Fetched bus stops:", data.count);
+          
+          // Log custom stops count
+          const customStops = data.stops.filter(s => s.id && s.id.startsWith('custom_'));
+          console.log("[RN] Custom stops in fetched data:", customStops.length);
 
           // Store for resend on WebView reload
-          busStopsRef.current = mergedStops;
+          busStopsRef.current = data.stops;
 
           // Send to WebView if ready
           if (webViewRef.current && webViewReady) {
             webViewRef.current.postMessage(JSON.stringify({
               type: "INIT_BUS_STOPS",
-              stops: mergedStops
+              stops: data.stops
             }));
           }
         }
@@ -1143,14 +1257,24 @@ const HomeScreen = () => {
     fetchBusStops();
   }, []); // Fetch only once on mount
   
-  // Sync busStopsRef with prop when it changes (from useBus hook)
+  // Note: We now receive full bus stops dataset via socket "INIT_BUS_STOPS" event
+  // The useBus hook only provides STATIC_STOPS (18 stops), so we ignore it for stops data
+
+  // Send INIT_BUS_STOPS when WebView becomes ready (if we have stops cached)
   useEffect(() => {
-    if (busStops && busStops.length > 0) {
-      busStopsRef.current = busStops;
-      console.log("[RN MiniMap] busStopsRef updated:", busStops.length);
+    if (webViewReady && webViewRef.current && busStopsRef.current?.length > 0) {
+      webViewRef.current.postMessage(JSON.stringify({
+        type: "INIT_BUS_STOPS",
+        stops: busStopsRef.current
+      }));
+      console.log("[RN MiniMap] INIT_BUS_STOPS sent on ready:", busStopsRef.current.length);
+      
+      // Log custom stops being sent
+      const customStops = busStopsRef.current.filter(s => s.id && s.id.startsWith('custom_'));
+      console.log("[RN MiniMap] Custom stops sent to WebView:", customStops.length);
     }
-  }, [busStops]);
-  
+  }, [webViewReady]);
+
   // Fetch user location
   useEffect(() => {
     (async () => {
@@ -1309,7 +1433,34 @@ const HomeScreen = () => {
             busStops={busStops}
             showNearestRoute={showNearestRoute}
             setShowNearestRoute={setShowNearestRoute}
+            onMessage={handleWebViewMessage}
           />
+        </View>
+
+        {/* Nearby Stops Section - Dynamic from WebView */}
+        <View style={styles.nearbyStopsSection}>
+          <Text style={styles.nearbyStopsTitle}>Nearby Stops</Text>
+          
+          {(() => {
+            console.log("nearestStops:", nearestStops);
+            return null;
+          })()}
+          
+          {nearestStops.length === 0 ? (
+            <Text style={styles.nearbyStopDetails}>Loading nearby stops...</Text>
+          ) : (
+            nearestStops.map((stop, index) => (
+              <TouchableOpacity key={stop.id || index} style={styles.nearbyStopCard}>
+                <View style={styles.nearbyStopInfo}>
+                  <Text style={styles.nearbyStopName}>{stop.name}</Text>
+                  <Text style={styles.nearbyStopDetails}>
+                    {stop.distanceStr} · {stop.etaMinutes} min walk
+                  </Text>
+                </View>
+                <Text style={styles.nearbyStopArrow}>›</Text>
+              </TouchableOpacity>
+            ))
+          )}
         </View>
       </ScrollView>
       
@@ -1497,6 +1648,55 @@ const styles = StyleSheet.create({
     color: "#fff",
     fontSize: 12,
     fontWeight: "600",
+  },
+
+  nearbyStopsSection: {
+    margin: 16,
+    marginTop: 8,
+  },
+
+  nearbyStopsTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#000",
+    marginBottom: 12,
+  },
+
+  nearbyStopCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#fff",
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 10,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+
+  nearbyStopInfo: {
+    flex: 1,
+  },
+
+  nearbyStopName: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#000",
+    marginBottom: 4,
+  },
+
+  nearbyStopDetails: {
+    fontSize: 14,
+    color: "#666",
+  },
+
+  nearbyStopArrow: {
+    fontSize: 24,
+    color: "#999",
+    fontWeight: "300",
   },
 
 });
