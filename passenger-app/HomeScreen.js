@@ -8,6 +8,7 @@ import {
   ScrollView,
   SafeAreaView,
   StatusBar,
+  DeviceEventEmitter,
 } from "react-native";
 import { WebView } from "react-native-webview";
 import * as Location from "expo-location";
@@ -69,6 +70,16 @@ const MiniMap = React.memo(({ webViewRef, setWebViewReady, onPress, buses, userL
       border: 3px solid white;
       border-radius: 50%;
       box-shadow: 0 0 6px rgba(0,0,0,0.6);
+    }
+    /* Bus markers - view-only mode */
+    .bus-marker { display: flex; justify-content: center; align-items: center; }
+    .bus-dot {
+      width: 14px;
+      height: 14px;
+      background: #007AFF;
+      border: 2px solid white;
+      border-radius: 50%;
+      box-shadow: 0 0 4px rgba(0,0,0,0.5);
     }
   </style>
 </head>
@@ -218,6 +229,23 @@ document.addEventListener("DOMContentLoaded", function() {
     window.__lastUserLocation = window.__lastUserLocation || null;
     window.__userMarker = window.__userMarker || null;
     
+    // Define global bus icon for markers (visible in WebView)
+    window.busIcon = L.icon({
+      iconUrl: "https://cdn-icons-png.flaticon.com/512/3448/3448339.png",
+      iconSize: [32, 32],
+      iconAnchor: [16, 16]
+    });
+    
+    // Define SOS emergency icon (red cross/alert)
+    window.sosIcon = L.icon({
+      iconUrl: "https://cdn-icons-png.flaticon.com/512/1041/1041916.png",
+      iconSize: [36, 36],
+      iconAnchor: [18, 18]
+    });
+    
+    // Initialize SOS markers storage (separate from bus markers)
+    window.sosMarkers = window.sosMarkers || {};
+    
     function updateUserLocation(lat, lng) {
       // Validate map is a valid Leaflet instance
       if (!window.map || typeof window.map.addLayer !== "function") {
@@ -229,6 +257,8 @@ document.addEventListener("DOMContentLoaded", function() {
       const pos = [lat, lng];
       window.__lastUserLocation = { lat, lng };
       
+      console.log("[MiniMap] updateUserLocation:", lat, lng, "marker exists:", !!window.__userMarker);
+      
       // Create marker if missing (happens on first GPS or after map recreation)
       if (!window.__userMarker) {
         const pulseIcon = L.divIcon({
@@ -238,6 +268,8 @@ document.addEventListener("DOMContentLoaded", function() {
           iconAnchor: [10, 10]
         });
         window.__userMarker = L.marker(pos, { icon: pulseIcon, zIndexOffset: 1000 }).addTo(window.map);
+        
+        console.log("[MiniMap] User marker CREATED at:", lat, lng);
         
         // Add tooltip - show on click, hide on map move
         window.__userMarker.bindTooltip("You are here", { 
@@ -314,7 +346,140 @@ document.addEventListener("DOMContentLoaded", function() {
             break;
 
           case "BUS_UPDATE":
-            send("BUS_UPDATE received: " + (data.buses?.length || 0) + " buses");
+            // View-only bus marker rendering (no popups, no interaction)
+            if (!window.map) {
+              send("BUS_UPDATE failed: map not ready");
+              return;
+            }
+            
+            // Initialize bus markers storage
+            if (!window.busMarkers) {
+              window.busMarkers = {};
+            }
+            
+            // Validate buses array
+            if (!data.buses || !Array.isArray(data.buses) || data.buses.length === 0) {
+              send("BUS_UPDATE: no buses to render");
+              return;
+            }
+            
+            send("BUS_UPDATE received: " + data.buses.length + " buses");
+            
+            // Process each bus in the array
+            data.buses.forEach(function(bus) {
+              // Validate bus data
+              if (!bus || !bus.busId || bus.lat == null || bus.lng == null) {
+                send("BUS_UPDATE: skip invalid bus");
+                return;
+              }
+              
+              const busId = bus.busId;
+              const busPos = [bus.lat, bus.lng];
+              
+              if (window.busMarkers[busId]) {
+                // Update existing marker position
+                window.busMarkers[busId].setLatLng(busPos);
+                send("BUS_UPDATE: " + busId + " moved");
+              } else {
+                // Create new marker (view-only, no popup, no interaction)
+                const marker = L.marker(busPos, { 
+                  icon: window.busIcon,
+                  interactive: false,
+                  zIndexOffset: 500
+                }).addTo(window.map);
+                
+                window.busMarkers[busId] = marker;
+                send("BUS_UPDATE: " + busId + " created");
+              }
+            });
+            break;
+
+          case "BUS_OFFLINE":
+            // Remove bus marker from map
+            if (!window.busMarkers || !data.busId) {
+              send("BUS_OFFLINE: no marker to remove");
+              return;
+            }
+            
+            const busId = data.busId;
+            if (window.busMarkers[busId]) {
+              window.map.removeLayer(window.busMarkers[busId]);
+              delete window.busMarkers[busId];
+              send("BUS_OFFLINE: " + busId + " removed");
+            } else {
+              send("BUS_OFFLINE: " + busId + " not found");
+            }
+            break;
+
+          case "SOS_TRIGGERED":
+            // Emergency: remove bus marker, add SOS marker
+            if (!data.busId) {
+              send("SOS_TRIGGERED: missing busId");
+              return;
+            }
+            const sosBusId = data.busId;
+            const sosLat = data.lat;
+            const sosLng = data.lng;
+            
+            // Remove bus marker if exists
+            if (window.busMarkers && window.busMarkers[sosBusId]) {
+              window.map.removeLayer(window.busMarkers[sosBusId]);
+              delete window.busMarkers[sosBusId];
+              send("SOS_TRIGGERED: bus marker " + sosBusId + " removed");
+            }
+            
+            // Add SOS marker at location
+            if (sosLat != null && sosLng != null) {
+              if (!window.sosMarkers) window.sosMarkers = {};
+              
+              // Remove existing SOS marker for this bus if any
+              if (window.sosMarkers[sosBusId]) {
+                window.map.removeLayer(window.sosMarkers[sosBusId]);
+              }
+              
+              const sosMarker = L.marker([sosLat, sosLng], { 
+                icon: window.sosIcon,
+                zIndexOffset: 2000
+              }).addTo(window.map);
+              
+              sosMarker.bindPopup("SOS EMERGENCY - Bus " + sosBusId, { autoClose: false });
+              window.sosMarkers[sosBusId] = sosMarker;
+              send("SOS_TRIGGERED: marker added for " + sosBusId);
+            }
+            break;
+
+          case "SOS_CLEARED":
+            // Remove SOS marker
+            if (!data.busId) {
+              send("SOS_CLEARED: missing busId");
+              return;
+            }
+            const clearBusId = data.busId;
+            
+            if (window.sosMarkers && window.sosMarkers[clearBusId]) {
+              window.map.removeLayer(window.sosMarkers[clearBusId]);
+              delete window.sosMarkers[clearBusId];
+              send("SOS_CLEARED: marker removed for " + clearBusId);
+            } else {
+              send("SOS_CLEARED: no marker found for " + clearBusId);
+            }
+            break;
+
+          case "SOS_ACKNOWLEDGED":
+            // Update popup to show acknowledged state (MiniMap - simple version)
+            if (!data.busId) {
+              send("SOS_ACKNOWLEDGED: missing busId");
+              return;
+            }
+            const ackBusId = data.busId;
+            
+            if (window.sosMarkers && window.sosMarkers[ackBusId]) {
+              const marker = window.sosMarkers[ackBusId];
+              marker.setPopupContent("✅ ACKNOWLEDGED - Bus " + ackBusId);
+              send("SOS_ACKNOWLEDGED: popup updated for " + ackBusId);
+            } else {
+              send("SOS_ACKNOWLEDGED: no marker found for " + ackBusId);
+            }
             break;
 
           case "RECENTER":
@@ -484,6 +649,9 @@ document.addEventListener("DOMContentLoaded", function() {
     
     // Initialize route layer storage (pure renderer, no state)
     window.__routeLayer = null;
+    
+    // Initialize bus markers storage (view-only mode)
+    window.busMarkers = {};
     
     // Process queued messages - ONLY ONCE
     if (!window.__queueProcessed) {
@@ -758,28 +926,6 @@ document.addEventListener("DOMContentLoaded", function() {
           <Text style={styles.actionButtonText}>Full Map</Text>
         </TouchableOpacity>
       </View>
-      {/* Nearest Route Toggle Button */}
-      <TouchableOpacity
-        onPress={() => {
-          setShowNearestRoute(prev => {
-            const newValue = !prev;
-            console.log("[RN] Toggle:", newValue);
-            return newValue;
-          });
-        }}
-        style={{
-          backgroundColor: '#007AFF',
-          paddingVertical: 14,
-          marginHorizontal: 12,
-          marginBottom: 12,
-          borderRadius: 10,
-          alignItems: 'center',
-        }}
-      >
-        <Text style={{ color: 'white', fontSize: 16, fontWeight: '600' }}>
-          {showNearestRoute ? 'Hide Route' : 'Show Route'}
-        </Text>
-      </TouchableOpacity>
     </View>
   );
 }, () => true);
@@ -931,12 +1077,23 @@ const HomeScreen = () => {
     }, 300);
   }, [buses]);
 
-  // Socket listener for BUS_LOCATION_UPDATE with logging
+  // Socket listener for BUS_LOCATION_UPDATE - forward to MiniMap WebView
   useEffect(() => {
     if (!socket) return;
 
     const handleBusLocationUpdate = (data) => {
       console.log("[RN HomeScreen] BUS_LOCATION_UPDATE received:", data);
+      
+      // Forward to MiniMap WebView
+      if (webViewRef.current && data && data.busId && data.lat != null && data.lng != null) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "BUS_LOCATION_UPDATE",
+          busId: data.busId,
+          lat: data.lat,
+          lng: data.lng
+        }));
+        console.log("[RN → MiniMap] BUS_LOCATION_UPDATE forwarded:", data.busId);
+      }
     };
 
     socket.on("BUS_LOCATION_UPDATE", handleBusLocationUpdate);
@@ -945,7 +1102,7 @@ const HomeScreen = () => {
     return () => {
       socket.off("BUS_LOCATION_UPDATE", handleBusLocationUpdate);
     };
-  }, [socket]);
+  }, [socket, webViewReady]);
 
   // Cleanup retry timeout on unmount
   useEffect(() => {
@@ -1039,15 +1196,55 @@ const HomeScreen = () => {
   useEffect(() => {
     if (!socket) return;
 
-    const handleBusOffline = (busId) => {
+    const handleBusOffline = (data) => {
+      const busId = data?.busId;
       console.log("[RN] Bus offline:", busId);
+      // Send to MiniMap WebView
       sendToWebView({ type: "BUS_OFFLINE", busId });
+      // Emit global event for FullMap to receive
+      DeviceEventEmitter.emit("BUS_OFFLINE_GLOBAL", { busId });
     };
 
     socket.on("BUS_OFFLINE", handleBusOffline);
 
+    // SOS Triggered - emergency state
+    const handleSosTriggered = (data) => {
+      const busId = data?.busId;
+      console.log("[RN] SOS triggered:", busId, "lat:", data?.lat, "lng:", data?.lng);
+      // Send to MiniMap WebView
+      sendToWebView({ type: "SOS_TRIGGERED", busId, lat: data?.lat, lng: data?.lng });
+      // Emit global event for FullMap
+      DeviceEventEmitter.emit("SOS_TRIGGERED_GLOBAL", { busId, lat: data?.lat, lng: data?.lng });
+    };
+    socket.on("SOS_TRIGGERED", handleSosTriggered);
+
+    // SOS Cleared - emergency resolved
+    const handleSosCleared = (data) => {
+      const busId = data?.busId;
+      console.log("[RN] SOS cleared:", busId);
+      // Send to MiniMap WebView
+      sendToWebView({ type: "SOS_CLEARED", busId });
+      // Emit global event for FullMap
+      DeviceEventEmitter.emit("SOS_CLEARED_GLOBAL", { busId });
+    };
+    socket.on("SOS_CLEARED", handleSosCleared);
+
+    // SOS Acknowledged - popup update only
+    const handleSosAcknowledged = (data) => {
+      const busId = data?.busId;
+      console.log("[RN] SOS acknowledged:", busId);
+      // Send to MiniMap WebView (popup update only)
+      sendToWebView({ type: "SOS_ACKNOWLEDGED", busId });
+      // Emit global event for FullMap
+      DeviceEventEmitter.emit("SOS_ACKNOWLEDGED_GLOBAL", { busId });
+    };
+    socket.on("SOS_ACKNOWLEDGED", handleSosAcknowledged);
+
     return () => {
       socket.off("BUS_OFFLINE", handleBusOffline);
+      socket.off("SOS_TRIGGERED", handleSosTriggered);
+      socket.off("SOS_CLEARED", handleSosCleared);
+      socket.off("SOS_ACKNOWLEDGED", handleSosAcknowledged);
     };
   }, [socket, sendToWebView]);
 

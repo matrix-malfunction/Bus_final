@@ -32,8 +32,8 @@ global.bgToken = null;
 global.bgLastLocation = null; // { latitude, longitude, timestamp }
 // SOS freeze state - stops location updates when SOS is active
 global.bgSosActive = false;
-// Explicit tracking control - prevents hidden background tracking
-global.trackingActive = false;
+// Background task tracking flag - single source of truth
+global.__trackingActive = false;
 
 // Race-safety for SOS polling
 let isCheckingSOS = false;
@@ -91,19 +91,26 @@ let fgLastLocation = null;
 
 // Define background location task - sends location to backend even when app is killed
 TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
-  if (error) {
-    console.log("[BG TASK] Error:", error.message);
-    return;
-  }
-  // GUARD: Only process if tracking explicitly enabled
-  if (!global.trackingActive) {
-    console.log("[BG TASK] Skipped - tracking not active");
-    return;
-  }
-  if (data) {
-    const { locations } = data;
-    const location = locations[0];
-    if (!location) return;
+  try {
+    if (error) {
+      console.log("[BG TASK] Error:", error.message);
+      return;
+    }
+    
+    // BLOCK if tracking not active
+    if (!global.__trackingActive) {
+      console.log("[BG TASK] BLOCKED - tracking not active");
+      return;
+    }
+    
+    // Validate data before access
+    if (!data || !data.locations || !Array.isArray(data.locations) || data.locations.length === 0) {
+      console.log("[BG TASK] No valid locations data");
+      return;
+    }
+    
+    const location = data.locations[0];
+    if (!location || !location.coords) return;
 
     // Extract coordinates safely from location.coords
     const rawLat = location.coords?.latitude;
@@ -182,6 +189,7 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
       speed: finalSpeed, // Computed speed (Haversine), not GPS
       source: "background_task",
       timestamp: new Date().toISOString(),
+      trackingActive: global.__trackingActive, // Dynamic tracking state
     };
 
     // Send with async retry (no stacked timeouts)
@@ -246,6 +254,8 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
     };
 
     await sendWithRetry();
+  } catch (e) {
+    console.log("[BG TASK] Unhandled error:", e.message);
   }
 });
 
@@ -266,6 +276,7 @@ export default function DriverTrackingScreen({ token }) {
   const pendingRetryRef = useRef(null);
   const networkCheckIntervalRef = useRef(null);
   const flushInProgressRef = useRef(false);
+  const guaranteeTimeoutRef = useRef(null);
 
   // Calculate distance between two coordinates (Haversine formula)
   const calculateDistance = (lat1, lng1, lat2, lng2) => {
@@ -369,7 +380,7 @@ export default function DriverTrackingScreen({ token }) {
         },
       });
 
-      global.trackingActive = true;
+      global.__trackingActive = true;
       console.log("[BG TRACKING] Started successfully");
       return true;
     } catch (err) {
@@ -389,7 +400,7 @@ export default function DriverTrackingScreen({ token }) {
     } catch (err) {
       console.log("[BG TRACKING] Stop error:", err.message);
     } finally {
-      global.trackingActive = false;
+      global.__trackingActive = false;
     }
   };
 
@@ -437,9 +448,17 @@ export default function DriverTrackingScreen({ token }) {
 
   // Send location to backend with retry queue and network awareness
   const sendLocationToBackend = async (location, attempt = 1, isFromQueue = false) => {
-    // GUARD: Only send if tracking explicitly enabled
-    if (!global.trackingActive) {
-      console.log("[API] BLOCKED - tracking not active");
+    // Throttle: prevent rapid sends (4 second minimum)
+    const now = Date.now();
+    if (now - lastSendTimeRef.current < 4000) {
+      console.log("[API] Throttled - too soon");
+      return;
+    }
+    lastSendTimeRef.current = now;
+    
+    // BLOCK if tracking not active
+    if (!global.__trackingActive) {
+      console.log("[API] BLOCKED - tracking stopped");
       return;
     }
 
@@ -450,9 +469,6 @@ export default function DriverTrackingScreen({ token }) {
       console.log("[API] Skipped - low accuracy:", accuracy.toFixed(1), "m");
       return;
     }
-    
-    // STRICT THROTTLE: Check API rate limiting (5 seconds)
-    const now = Date.now();
     
     // IGNORE GPS speed - compute using Haversine instead (more reliable when stationary)
     const currLocation = { latitude, longitude, timestamp: now };
@@ -531,6 +547,7 @@ export default function DriverTrackingScreen({ token }) {
         speed: finalSpeed, // Computed speed (Haversine), not GPS
         source: isFromQueue ? "queue_retry" : "watch_position",
         timestamp: new Date().toISOString(),
+        trackingActive: global.__trackingActive, // Dynamic tracking state
       };
 
       const headers = { "Content-Type": "application/json" };
@@ -603,6 +620,12 @@ export default function DriverTrackingScreen({ token }) {
 
   // FLUSH QUEUE: Process all queued items when online
   const flushQueue = async () => {
+    // GUARD: Don't flush if tracking stopped
+    if (!global.__trackingActive) {
+      console.log("[QUEUE] Flush cancelled - tracking stopped");
+      return;
+    }
+    
     if (failedQueue.length === 0 || flushInProgressRef.current) return;
 
     flushInProgressRef.current = true;
@@ -611,6 +634,12 @@ export default function DriverTrackingScreen({ token }) {
 
     // Process one at a time with delay to respect rate limits
     for (let i = 0; i < failedQueue.length; i++) {
+      // Check tracking state before each item
+      if (!global.__trackingActive) {
+        console.log("[QUEUE] Flush aborted - tracking stopped mid-flush");
+        break;
+      }
+      
       const item = failedQueue[i];
       await sendLocationToBackend(item.location, 1, true);
 
@@ -726,11 +755,17 @@ export default function DriverTrackingScreen({ token }) {
 
       locationSubscriptionRef.current = subscription;
       setIsTracking(true);
+      global.__trackingActive = true;
       setStatus("Tracking active (optimized)");
       console.log("[TRACKING] watchPositionAsync started");
 
       // Guarantee update after START (avoids freeze when GPS is slow)
-      setTimeout(async () => {
+      guaranteeTimeoutRef.current = setTimeout(async () => {
+        // GUARD: Don't send if tracking stopped
+        if (!global.__trackingActive) {
+          console.log("[TRACKING] Guaranteed update cancelled - tracking stopped");
+          return;
+        }
         try {
           const loc = await Location.getCurrentPositionAsync({
             accuracy: Location.Accuracy.High
@@ -746,6 +781,7 @@ export default function DriverTrackingScreen({ token }) {
               busId,
               lat: loc.coords.latitude,
               lng: loc.coords.longitude,
+              trackingActive: global.__trackingActive,
             }),
           });
           console.log("[TRACKING] Guaranteed update sent after start");
@@ -777,14 +813,46 @@ export default function DriverTrackingScreen({ token }) {
     await stopBackgroundTracking();
     
     // Call backend to stop tracking (emits BUS_OFFLINE)
-    await callBackendStopTracking();
+    try {
+      const stopBody = {
+        busId,
+        trackingActive: false,
+        timestamp: new Date().toISOString(),
+      };
+      const headers = { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      };
+      await fetch(`${API_BASE_URL}/api/driver/location`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(stopBody),
+      });
+      console.log("[STOP] Sent trackingActive: false to backend");
+    } catch (err) {
+      console.log("[STOP] Failed to notify backend:", err.message);
+    }
+    
+    // CLEAR QUEUE: Prevent queued updates from reviving bus after STOP
+    setFailedQueue([]);
+    saveQueueToStorage([]);
+    console.log("[STOP] Queue cleared");
 
     // Clear any pending retries
     if (pendingRetryRef.current) {
+      clearTimeout(pendingRetryRef.current);
       pendingRetryRef.current = null;
+    }
+    
+    // Clear guarantee timeout
+    if (guaranteeTimeoutRef.current) {
+      clearTimeout(guaranteeTimeoutRef.current);
+      guaranteeTimeoutRef.current = null;
+      console.log("[STOP] Guarantee timeout cleared");
     }
 
     setIsTracking(false);
+    global.__trackingActive = false;
     setStatus("Tracking stopped");
   };
 
@@ -845,20 +913,27 @@ export default function DriverTrackingScreen({ token }) {
         const storedLastLoc = await AsyncStorage.getItem(LAST_LOCATION_KEY);
         if (storedLastLoc) {
           try {
-            global.bgLastLocation = JSON.parse(storedLastLoc);
+            lastLocationRef.current = JSON.parse(storedLastLoc);
             console.log("[APP START] Restored last location");
           } catch (parseErr) {
             console.log("[APP START] Failed to parse last location:", parseErr.message);
           }
         }
-
-        // Check if background tracking is running
-        const isRunning = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
-        if (isRunning && !global.trackingActive) {
-          console.log("[APP START] Stopping orphaned background tracking");
-          await stopBackgroundTracking();
-        } else {
-          console.log("[APP START] Background tracking already running");
+        
+        // CLEAR QUEUE on app startup: Prevent stale updates
+        await AsyncStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify([]));
+        console.log("[APP START] Queue cleared");
+        
+        // Check if background tracking is running and stop orphaned tasks
+        try {
+          const isRunning = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+          if (isRunning) {
+            console.log("[APP START] Stopping orphaned background tracking");
+            await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK);
+            global.__trackingActive = false;
+          }
+        } catch (bgCheckErr) {
+          console.log("[APP START] BG check error:", bgCheckErr.message);
         }
       } catch (err) {
         console.log("[APP START] Check error:", err.message);

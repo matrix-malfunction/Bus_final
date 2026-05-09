@@ -1,7 +1,10 @@
 import { useMemo, useEffect, useRef, useState, useCallback } from "react";
-import { StyleSheet, View, TouchableOpacity, Text } from "react-native";
+import { StyleSheet, View, TouchableOpacity, Text, DeviceEventEmitter } from "react-native";
 import { WebView } from "react-native-webview";
 import { useBus } from "./BusContext";
+
+// API Configuration
+const API_BASE_URL = 'https://bus-tracking-backend-6htm.onrender.com/api';
 
 function escapeText(input) {
   return String(input ?? "Bus").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
@@ -82,6 +85,7 @@ export default function FullMapScreen({ route }) {
 
         // Send INIT_BUS_STOPS on MAP_READY
         if (busStops && webViewRef.current) {
+          console.log("[RN] stops:", busStops.length);
           webViewRef.current.postMessage(JSON.stringify({
             type: "INIT_BUS_STOPS",
             stops: busStops
@@ -142,6 +146,35 @@ export default function FullMapScreen({ route }) {
       if (data.type === "SET_FOLLOW") {
         console.log("[FullMap] SET_FOLLOW:", data.busId);
         setFollowBusId(data.busId || null); // Direct set, no toggle logic
+      }
+
+      // SOS_ACK from WebView (user clicked ACK button)
+      if (data.type === "SOS_ACK") {
+        const busId = data.busId;
+        console.log("[FullMap] SOS_ACK from WebView:", busId);
+        
+        // Call backend to acknowledge SOS
+        fetch(`${API_BASE_URL}/sos/ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ busId })
+        })
+        .then(response => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        })
+        .then(result => {
+          console.log("[FullMap] SOS acknowledged:", result);
+          // Backend will emit SOS_ACKNOWLEDGED to all clients
+        })
+        .catch(error => {
+          console.error("[FullMap] SOS ack failed:", error.message);
+          // Send ACK_FAILED back to WebView to re-enable button
+          webViewRef.current?.postMessage(JSON.stringify({
+            type: "ACK_FAILED",
+            busId: busId
+          }));
+        });
       }
     } catch (e) {
       console.log("[FullMap] Invalid message:", e.message);
@@ -242,8 +275,102 @@ export default function FullMapScreen({ route }) {
     };
 
     socket.on("BUS_OFFLINE", handleBusOffline);
-    return () => socket.off("BUS_OFFLINE", handleBusOffline);
+    
+    // SOS_ACKNOWLEDGED - popup update only, no new marker
+    const handleSosAcknowledged = (data) => {
+      console.log("[FullMap] SOS_ACKNOWLEDGED received:", data.busId);
+      if (webViewRef.current && webViewReady) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "SOS_ACKNOWLEDGED",
+          busId: data.busId
+        }));
+      }
+    };
+    socket.on("SOS_ACKNOWLEDGED", handleSosAcknowledged);
+    
+    return () => {
+      socket.off("BUS_OFFLINE", handleBusOffline);
+      socket.off("SOS_ACKNOWLEDGED", handleSosAcknowledged);
+    };
   }, [socket, webViewReady, followBusId, setFollowBusId]);
+
+  // Global event listener for BUS_OFFLINE from HomeScreen
+  useEffect(() => {
+    const handleGlobalBusOffline = (data) => {
+      console.log("[FullMap] Global BUS_OFFLINE received:", data.busId);
+      if (webViewRef.current) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "BUS_OFFLINE",
+          busId: data.busId
+        }));
+      }
+    };
+
+    const subscription = DeviceEventEmitter.addListener("BUS_OFFLINE_GLOBAL", handleGlobalBusOffline);
+
+    return () => {
+      subscription.remove();
+    };
+  }, [webViewRef]);
+
+  // Global event listener for SOS_TRIGGERED from HomeScreen
+  useEffect(() => {
+    const handleGlobalSosTriggered = (data) => {
+      console.log("[FullMap] Global SOS_TRIGGERED received:", data.busId, "lat:", data?.lat, "lng:", data?.lng);
+      if (webViewRef.current) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "SOS_TRIGGERED",
+          busId: data.busId,
+          lat: data.lat,
+          lng: data.lng
+        }));
+      }
+    };
+
+    const subscription = DeviceEventEmitter.addListener("SOS_TRIGGERED_GLOBAL", handleGlobalSosTriggered);
+
+    return () => {
+      subscription.remove();
+    };
+  }, [webViewRef]);
+
+  // Global event listener for SOS_CLEARED from HomeScreen
+  useEffect(() => {
+    const handleGlobalSosCleared = (data) => {
+      console.log("[FullMap] Global SOS_CLEARED received:", data.busId);
+      if (webViewRef.current) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "SOS_CLEARED",
+          busId: data.busId
+        }));
+      }
+    };
+
+    const subscription = DeviceEventEmitter.addListener("SOS_CLEARED_GLOBAL", handleGlobalSosCleared);
+
+    return () => {
+      subscription.remove();
+    };
+  }, [webViewRef]);
+
+  // Global event listener for SOS_ACKNOWLEDGED from HomeScreen
+  useEffect(() => {
+    const handleGlobalSosAcknowledged = (data) => {
+      console.log("[FullMap] Global SOS_ACKNOWLEDGED received:", data.busId);
+      if (webViewRef.current) {
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "SOS_ACKNOWLEDGED",
+          busId: data.busId
+        }));
+      }
+    };
+
+    const subscription = DeviceEventEmitter.addListener("SOS_ACKNOWLEDGED_GLOBAL", handleGlobalSosAcknowledged);
+
+    return () => {
+      subscription.remove();
+    };
+  }, [webViewRef]);
 
   const mapHTML = useMemo(
     () => `
@@ -561,6 +688,16 @@ export default function FullMapScreen({ route }) {
               iconAnchor: [18, 36]
             });
 
+            // SOS emergency icon
+            const sosIcon = L.icon({
+              iconUrl: "https://cdn-icons-png.flaticon.com/512/1041/1041916.png",
+              iconSize: [36, 36],
+              iconAnchor: [18, 18]
+            });
+
+            // Initialize SOS markers storage (separate from bus markers)
+            window.sosMarkers = window.sosMarkers || {};
+
             // 3a) CREATE POPUP HTML (dynamic follow/unfollow)
             // SPEEDOMETER UPDATE FUNCTION - UI only, no calculations
             function updateSpeedometer(busData) {
@@ -841,6 +978,9 @@ window.__busStopMarkers = {};
 window.__stopBusMap = {}; // stopId → [busIds]
 window.__highlightedStopId = null; // Currently highlighted stop
 window.__lastNearestDistance = Infinity; // For hysteresis
+window.__nearestStopMarker = null; // Direct reference to nearest stop marker
+window.__nearestStopData = null; // Stop data for nearest stop
+window.__nearestDistance = Infinity; // Distance to nearest stop
 window.__nearestRouteLayer = null; // Polyline for nearest stop route
 window.__showNearestRoute = false; // Route toggle state
 window.__lastUserLocation = null; // Cached user location
@@ -931,63 +1071,185 @@ function updateStopPopups() {
   });
 }
 
+// Apply highlight to a marker
+function applyHighlight(marker) {
+  if (!marker || !marker.__stopName) return;
+  marker.setIcon(L.divIcon({
+    html: '<div class="bus-stop-marker">' +
+      '<div class="bus-stop-icon bus-stop-highlighted">🛑</div>' +
+      '<div class="bus-stop-label bus-stop-highlighted-label">' + marker.__stopName + '</div>' +
+      '</div>',
+    className: '',
+    iconSize: [80, 60],
+    iconAnchor: [40, 60]
+  }));
+}
+
+// Remove highlight from current highlighted stop
+function removeHighlight() {
+  if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
+    const marker = window.__busStopMarkers[window.__highlightedStopId];
+    const stopName = marker.__stopName || 'Stop';
+    marker.setIcon(createStopIcon(stopName));
+    window.__highlightedStopId = null;
+    console.log("[WEBVIEW] Highlight removed from", stopName);
+  }
+}
+
 // Highlight nearest stop to user
-function highlightNearestStop(userLat, userLng) {
-  if (!window.__busStops || !window.__busStops.length) return;
+function highlightNearestStop(userLat, userLng, shouldHighlight) {
+  console.log("[WEBVIEW] highlightNearestStop called:", userLat, userLng, "shouldHighlight:", shouldHighlight, "markers:", Object.keys(window.__busStopMarkers || {}).length, "stops:", window.__busStops?.length);
+  
+  if (!window.__busStops || !window.__busStops.length) {
+    console.log("[WEBVIEW] highlightNearestStop: no bus stops available");
+    return;
+  }
+  
+  if (!window.__busStopMarkers || Object.keys(window.__busStopMarkers).length === 0) {
+    console.log("[WEBVIEW] highlightNearestStop: no bus stop markers rendered");
+    return;
+  }
 
   let nearestStop = null;
   let minDistance = Infinity;
+  let nearestMarker = null;
 
   window.__busStops.forEach(function(stop) {
     if (!stop.id || !stop.lat || !stop.lng) return;
+    
+    // Only consider stops that have rendered markers
+    const marker = window.__busStopMarkers[stop.id];
+    if (!marker) return;
 
     const distance = haversine(userLat, userLng, stop.lat, stop.lng);
-
-    if (distance < minDistance && distance < 500) { // 500m threshold
+    
+    // Always track closest stop (no distance threshold)
+    if (distance < minDistance) {
       minDistance = distance;
       nearestStop = stop;
+      nearestMarker = marker;
     }
   });
+  
+  console.log("[WEBVIEW] highlightNearestStop: closest=" + (nearestStop?.name || "none") + " distance=" + (minDistance !== Infinity ? minDistance.toFixed(0) + "m" : "N/A"));
 
-  // Hysteresis: only change if distance changed by >20m
-  if (nearestStop) {
-    const distanceChange = Math.abs(minDistance - window.__lastNearestDistance);
-
-    if (nearestStop.id !== window.__highlightedStopId && distanceChange > 20) {
-      // Reset previous highlight
-      if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
-        const prevMarker = window.__busStopMarkers[window.__highlightedStopId];
-        const prevStopName = prevMarker.__stopName || 'Stop';
-        prevMarker.setIcon(createStopIcon(prevStopName));
-      }
-
-      // Highlight new stop
-      if (window.__busStopMarkers[nearestStop.id]) {
-        const marker = window.__busStopMarkers[nearestStop.id];
-        marker.setIcon(L.divIcon({
-          html: '<div class="bus-stop-marker">' +
-            '<div class="bus-stop-icon bus-stop-highlighted">🛑</div>' +
-            '<div class="bus-stop-label bus-stop-highlighted-label">' + nearestStop.name + '</div>' +
-            '</div>',
-          className: '',
-          iconSize: [80, 60],
-          iconAnchor: [40, 60]
-        }));
-      }
-
-      window.__highlightedStopId = nearestStop.id;
-      window.__lastNearestDistance = minDistance;
-      console.log("[WEBVIEW] Highlighted nearest stop:", nearestStop.name, "Distance:", minDistance.toFixed(0) + "m");
-    }
-  } else {
-    // Reset highlight if no stop within 500m
-    if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
+  // Always update popup if we have a nearest stop
+  if (nearestStop && nearestMarker) {
+    // Reset previous highlight if stop changed
+    if (window.__highlightedStopId && window.__highlightedStopId !== nearestStop.id && window.__busStopMarkers[window.__highlightedStopId]) {
       const prevMarker = window.__busStopMarkers[window.__highlightedStopId];
       const prevStopName = prevMarker.__stopName || 'Stop';
       prevMarker.setIcon(createStopIcon(prevStopName));
-      window.__highlightedStopId = null;
-      window.__lastNearestDistance = Infinity;
     }
+    
+    // Apply highlight only if shouldHighlight AND __showNearestRoute
+    if (shouldHighlight && window.__showNearestRoute && window.__highlightedStopId !== nearestStop.id) {
+      applyHighlight(nearestMarker);
+      window.__highlightedStopId = nearestStop.id;
+      console.log("[WEBVIEW] Highlight applied to:", nearestStop.name);
+    } else if (!shouldHighlight || !window.__showNearestRoute) {
+      // Store nearest but don't highlight
+      window.__highlightedStopId = nearestStop.id;
+    }
+
+    // Check if nearest stop changed
+    const stopChanged = window.__highlightedStopId && window.__highlightedStopId !== nearestStop.id;
+    
+    // Store data (always)
+    window.__nearestStopMarker = nearestMarker;
+    window.__nearestStopData = nearestStop;
+    window.__nearestDistance = minDistance;
+    
+    // Only update popup if showNearestRoute is true
+    if (window.__showNearestRoute) {
+      updateNearestStopPopup(userLat, userLng);
+      
+      // If nearest stop changed, switch popup to new marker
+      if (stopChanged && window.__busStopMarkers[window.__highlightedStopId]) {
+        const prevMarker = window.__busStopMarkers[window.__highlightedStopId];
+        if (prevMarker.isPopupOpen()) {
+          prevMarker.closePopup();
+        }
+        nearestMarker.openPopup();
+        console.log("[WEBVIEW] Popup switched to new nearest stop:", nearestStop.name);
+      }
+    }
+  } else {
+    // No stop found - clear highlight
+    removeHighlight();
+    window.__nearestStopMarker = null;
+    window.__nearestStopData = null;
+    window.__nearestDistance = Infinity;
+    console.log("[WEBVIEW] highlightNearestStop: no nearest stop found");
+  }
+}
+
+// Update nearest stop popup with distance and ETA
+function updateNearestStopPopup(userLat, userLng) {
+  // Return early if route toggle is off
+  if (!window.__showNearestRoute) {
+    return;
+  }
+  
+  console.log("[WEBVIEW] updateNearestStopPopup called with:", userLat, userLng);
+  
+  if (!window.__nearestStopMarker) {
+    console.log("[WEBVIEW] updateNearestStopPopup: no nearest marker stored");
+    return;
+  }
+  
+  const marker = window.__nearestStopMarker;
+  if (!marker) {
+    console.log("[WEBVIEW] updateNearestStopPopup: marker is null");
+    return;
+  }
+  
+  const stopName = marker.__stopName || 'Bus Stop';
+  const stopLat = marker.getLatLng().lat;
+  const stopLng = marker.getLatLng().lng;
+  
+  console.log("[WEBVIEW] updateNearestStopPopup: stopName=" + stopName + " stopLat=" + stopLat + " stopLng=" + stopLng);
+  
+  // Compute distance using Haversine
+  const distance = haversine(userLat, userLng, stopLat, stopLng);
+  
+  // Compute ETA (walking speed: 1.4 m/s)
+  const etaSeconds = Math.round(distance / 1.4);
+  const etaMinutes = Math.ceil(etaSeconds / 60);
+  
+  // Format distance
+  let distanceStr;
+  if (distance < 1000) {
+    distanceStr = Math.round(distance) + ' m';
+  } else {
+    distanceStr = (distance / 1000).toFixed(1) + ' km';
+  }
+  
+  console.log("[WEBVIEW] updateNearestStopPopup: distance=" + distanceStr + " ETA=" + etaMinutes + "min");
+  
+  // Build popup content with distance and ETA
+  let content = '<b>' + stopName + '</b><br>';
+  content += '<span style="font-size:12px;color:#007AFF;">📍 ' + distanceStr + ' away</span><br>';
+  content += '<span style="font-size:12px;color:#16a34a;">🚶 ' + etaMinutes + ' min walk</span>';
+  
+  // Get buses at this stop
+  const busIds = window.__stopBusMap[window.__highlightedStopId] || [];
+  if (busIds.length > 0) {
+    content += '<br><span style="font-size:12px;color:#666;">🚌 ' + busIds.length + ' bus' + (busIds.length > 1 ? 'es' : '') + ' nearby</span>';
+  }
+  
+  // Update popup content using setPopupContent (not bindPopup)
+  if (marker.getPopup()) {
+    marker.setPopupContent(content);
+    // Force UI refresh if popup is open
+    if (marker.isPopupOpen()) {
+      marker.getPopup().update();
+      console.log("[WEBVIEW] updateNearestStopPopup: popup content updated and UI refreshed");
+    } else {
+      console.log("[WEBVIEW] updateNearestStopPopup: popup content updated (popup closed)");
+    }
+  } else {
+    console.log("[WEBVIEW] updateNearestStopPopup: no popup exists on marker");
   }
 }
 
@@ -1106,6 +1368,7 @@ async function updateNearestRoute(lat, lng) {
 
 // Render bus stops
 function renderBusStops() {
+  console.log("[WEBVIEW] renderBusStops received:", window.__busStops?.length, "stops");
   if (!window.map || !window.__busStops) return;
 
   const zoom = window.map.getZoom();
@@ -1162,6 +1425,36 @@ window.map.on("zoomend", function() {
               document.getElementById("recenter-btn")?.addEventListener("click", recenterToUser);
             }
 
+            // SOS ACKNOWLEDGE FUNCTION - sends to React Native
+            function acknowledgeSos(busId) {
+              if (!busId) return;
+              
+              // Prevent double-click
+              if (window.__ackLock && window.__ackLock[busId]) {
+                console.log("[WEBVIEW] ACK already pending for", busId);
+                return;
+              }
+              
+              // Set lock
+              if (!window.__ackLock) window.__ackLock = {};
+              window.__ackLock[busId] = true;
+              
+              // Disable button
+              const btn = document.getElementById(\`ack-btn-\${busId}\`);
+              if (btn) {
+                btn.disabled = true;
+                btn.textContent = "ACKNOWLEDGING...";
+                btn.style.background = "#999";
+              }
+              
+              // Send to React Native
+              window.ReactNativeWebView?.postMessage(JSON.stringify({
+                type: "SOS_ACK",
+                busId: busId
+              }));
+              console.log("[WEBVIEW] SOS_ACK sent for", busId);
+            }
+
             // 9) MESSAGE HANDLER
             function handleMessage(event) {
               let data;
@@ -1174,6 +1467,7 @@ window.map.on("zoomend", function() {
 
               switch (data.type) {
                 case "INIT_BUS_STOPS":
+                  console.log("[WEBVIEW] INIT_BUS_STOPS received:", data.stops?.length);
                   if (!Array.isArray(data.stops)) {
                     console.log("[WEBVIEW] Invalid INIT_BUS_STOPS");
                     return;
@@ -1208,7 +1502,7 @@ window.map.on("zoomend", function() {
                     const lng = Number(data.payload.lng);
                     if (!isNaN(lat) && !isNaN(lng)) {
                       setUserLocation(lat, lng);
-                      highlightNearestStop(lat, lng);
+                      highlightNearestStop(lat, lng, false);
                       
                       // Store user location for route drawing
                       window.__lastUserLocation = {
@@ -1234,19 +1528,86 @@ window.map.on("zoomend", function() {
                   console.log("[WEBVIEW] Last location:", window.__lastUserLocation);
                   
                   if (!data.enabled) {
+                    // Remove highlight when toggled off
+                    removeHighlight();
+                    // Reset popup to default (no ETA/distance)
+                    if (window.__nearestStopMarker) {
+                      const marker = window.__nearestStopMarker;
+                      const stopName = marker.__stopName || 'Bus Stop';
+                      marker.setPopupContent('<b>' + stopName + '</b>');
+                    }
                     if (window.__nearestRouteLayer) {
                       window.map.removeLayer(window.__nearestRouteLayer);
                       window.__nearestRouteLayer = null;
                     }
                   } else {
-                    // CRITICAL: draw immediately using last location
+                    // Highlight nearest stop when toggled on
                     if (window.__lastUserLocation) {
+                      highlightNearestStop(
+                        window.__lastUserLocation.lat,
+                        window.__lastUserLocation.lng,
+                        true
+                      );
                       updateNearestRoute(
                         window.__lastUserLocation.lat,
                         window.__lastUserLocation.lng
                       );
+                      // Open popup for nearest stop
+                      if (window.__nearestStopMarker) {
+                        window.__nearestStopMarker.openPopup();
+                      }
                     }
                   }
+                  break;
+
+                case "FOCUS_NEAREST_STOP":
+                  // Open popup and center map on nearest stop
+                  if (!window.__nearestStopMarker) {
+                    console.log("[WEBVIEW] FOCUS_NEAREST_STOP: no nearest marker");
+                    break;
+                  }
+                  
+                  const nearestMarker = window.__nearestStopMarker;
+                  
+                  // Get marker position
+                  const markerPos = nearestMarker.getLatLng();
+                  if (!markerPos) {
+                    console.log("[WEBVIEW] FOCUS_NEAREST_STOP: invalid marker position");
+                    break;
+                  }
+                  
+                  // Update popup with latest distance/ETA before opening
+                  if (window.__lastUserLocation) {
+                    console.log("[WEBVIEW] FOCUS_NEAREST_STOP: updating popup before open");
+                    updateNearestStopPopup(window.__lastUserLocation.lat, window.__lastUserLocation.lng);
+                  }
+                  
+                  // Fly to marker, then open popup after animation completes
+                  window.map.once("moveend", function() {
+                    // Guards before opening popup
+                    if (!nearestMarker) {
+                      console.log("[WEBVIEW] FOCUS_NEAREST_STOP: marker lost during fly");
+                      return;
+                    }
+                    if (!nearestMarker.getPopup()) {
+                      console.log("[WEBVIEW] FOCUS_NEAREST_STOP: marker has no popup");
+                      return;
+                    }
+                    if (!window.map.hasLayer(nearestMarker)) {
+                      console.log("[WEBVIEW] FOCUS_NEAREST_STOP: marker not on map");
+                      return;
+                    }
+                    
+                    nearestMarker.openPopup();
+                    console.log("[WEBVIEW] FOCUS_NEAREST_STOP: popup opened after flyTo");
+                  });
+                  
+                  window.map.flyTo(markerPos, 16, {
+                    duration: 1.5,
+                    easeLinearity: 0.25
+                  });
+                  
+                  console.log("[WEBVIEW] FOCUS_NEAREST_STOP: flying to nearest stop");
                   break;
 
                 case "FOLLOW_UPDATE":
@@ -1285,6 +1646,144 @@ window.map.on("zoomend", function() {
                     window.__followBusId = null;
                     resetSpeedometer();
                     console.log("[WEBVIEW] Cleared follow for offline bus:", data.busId);
+                  }
+                  break;
+
+                case "SOS_TRIGGERED":
+                  // Emergency: remove bus marker, add SOS marker
+                  if (!data.busId) {
+                    console.log("[WEBVIEW] SOS_TRIGGERED: missing busId");
+                    return;
+                  }
+                  const sosBusId = data.busId;
+                  const sosLat = data.lat;
+                  const sosLng = data.lng;
+                  
+                  // Remove bus marker if exists
+                  if (window.busMarkers && window.busMarkers[sosBusId]) {
+                    window.map.removeLayer(window.busMarkers[sosBusId]);
+                    delete window.busMarkers[sosBusId];
+                    console.log("[WEBVIEW] SOS_TRIGGERED: bus marker removed", sosBusId);
+                  }
+                  
+                  // Clear follow if this bus was being followed
+                  if (window.__followBusId === sosBusId) {
+                    window.__followBusId = null;
+                    resetSpeedometer();
+                    console.log("[WEBVIEW] SOS_TRIGGERED: cleared follow", sosBusId);
+                  }
+                  
+                  // Add SOS marker at location
+                  if (sosLat != null && sosLng != null) {
+                    if (!window.sosMarkers) window.sosMarkers = {};
+                    if (!window.__ackLock) window.__ackLock = {};
+                    
+                    // Remove existing SOS marker for this bus if any
+                    if (window.sosMarkers[sosBusId]) {
+                      window.map.removeLayer(window.sosMarkers[sosBusId]);
+                    }
+                    
+                    const sosMarker = L.marker([sosLat, sosLng], { 
+                      icon: sosIcon,
+                      zIndexOffset: 2000
+                    }).addTo(window.map);
+                    
+                    // Create popup content with ACK button
+                    const popupContent = \`
+                      <div style="text-align: center; min-width: 150px;">
+                        <div style="color: #dc2626; font-weight: bold; margin-bottom: 8px;">
+                          🚨 SOS EMERGENCY
+                        </div>
+                        <div style="font-size: 14px; margin-bottom: 12px;">
+                          Bus \${sosBusId}
+                        </div>
+                        <button id="ack-btn-\${sosBusId}" onclick="acknowledgeSos('\${sosBusId}')" 
+                          style="background: #007AFF; color: white; border: none; padding: 8px 16px; 
+                                 border-radius: 6px; cursor: pointer; font-size: 14px;">
+                          ACKNOWLEDGE
+                        </button>
+                      </div>
+                    \`;
+                    
+                    sosMarker.bindPopup(popupContent, { autoClose: false });
+                    sosMarker.__sosBusId = sosBusId;
+                    sosMarker.__acknowledged = false;
+                    window.sosMarkers[sosBusId] = sosMarker;
+                    
+                    // Open popup immediately
+                    sosMarker.openPopup();
+                    console.log("[WEBVIEW] SOS_TRIGGERED: marker added", sosBusId);
+                  }
+                  break;
+
+                case "SOS_ACKNOWLEDGED":
+                  // Update popup to show acknowledged state
+                  if (!data.busId) {
+                    console.log("[WEBVIEW] SOS_ACKNOWLEDGED: missing busId");
+                    return;
+                  }
+                  const ackBusId = data.busId;
+                  
+                  if (window.sosMarkers && window.sosMarkers[ackBusId]) {
+                    const marker = window.sosMarkers[ackBusId];
+                    marker.__acknowledged = true;
+                    
+                    // Update popup content
+                    const acknowledgedContent = \`
+                      <div style="text-align: center; min-width: 150px;">
+                        <div style="color: #16a34a; font-weight: bold; margin-bottom: 8px;">
+                          ✅ ACKNOWLEDGED
+                        </div>
+                        <div style="font-size: 14px; margin-bottom: 8px;">
+                          Bus \${ackBusId}
+                        </div>
+                        <div style="font-size: 12px; color: #666;">
+                          Emergency is being handled
+                        </div>
+                      </div>
+                    \`;
+                    
+                    marker.setPopupContent(acknowledgedContent);
+                    console.log("[WEBVIEW] SOS_ACKNOWLEDGED: popup updated", ackBusId);
+                  } else {
+                    console.log("[WEBVIEW] SOS_ACKNOWLEDGED: no marker found", ackBusId);
+                  }
+                  break;
+
+                case "ACK_FAILED":
+                  // Re-enable ACK button on failure
+                  if (!data.busId) return;
+                  const failedBusId = data.busId;
+                  
+                  // Clear lock to allow retry
+                  if (window.__ackLock) {
+                    delete window.__ackLock[failedBusId];
+                  }
+                  
+                  // Update button if popup is open
+                  const btn = document.getElementById(\`ack-btn-\${failedBusId}\`);
+                  if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = "ACKNOWLEDGE";
+                    btn.style.background = "#007AFF";
+                  }
+                  console.log("[WEBVIEW] ACK_FAILED: button re-enabled", failedBusId);
+                  break;
+
+                case "SOS_CLEARED":
+                  // Remove SOS marker
+                  if (!data.busId) {
+                    console.log("[WEBVIEW] SOS_CLEARED: missing busId");
+                    return;
+                  }
+                  const clearBusId = data.busId;
+                  
+                  if (window.sosMarkers && window.sosMarkers[clearBusId]) {
+                    window.map.removeLayer(window.sosMarkers[clearBusId]);
+                    delete window.sosMarkers[clearBusId];
+                    console.log("[WEBVIEW] SOS_CLEARED: marker removed", clearBusId);
+                  } else {
+                    console.log("[WEBVIEW] SOS_CLEARED: no marker found", clearBusId);
                   }
                   break;
 
