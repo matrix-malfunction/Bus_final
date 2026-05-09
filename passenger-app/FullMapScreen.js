@@ -283,87 +283,57 @@ export default function FullMapScreen({ route }) {
     });
   }, [busProgress, webViewReady]);
 
-  // Route corridor: fetch and draw when active route changes (NOT on GPS updates)
+  // ACTIVE ROUTE CORRIDOR: Draw route for followed/selected bus only
+  // Uses backend-provided routeCoords (no HTTP fetch)
   useEffect(() => {
-    // Determine active route from followed or selected bus
+    // Determine active bus from follow or selection
     const activeBusId = followBusId || selectedBusId;
     const activeBus = buses.find(b => b.busId === activeBusId || b.id === activeBusId);
-    const activeRouteId = activeBus?.routeId || null;
     
-    // Guard 1: No active route - clear and exit
-    if (!activeRouteId || !webViewRef.current || !webViewReady) {
-      if (!activeRouteId && lastDrawnRouteRef.current) {
+    // Guard 1: No active bus - clear route and exit
+    if (!activeBusId || !activeBus || !webViewRef.current || !webViewReady) {
+      if (lastDrawnRouteRef.current) {
         webViewRef.current?.postMessage(JSON.stringify({ type: "CLEAR_ROUTE" }));
         lastDrawnRouteRef.current = null;
       }
       return;
     }
     
-    // Guard 2: Skip if same route already drawn (prevents redraw spam)
-    if (lastDrawnRouteRef.current === activeRouteId) {
-      console.log("[Route Corridor] Skip - already drawn:", activeRouteId);
+    const activeRouteId = activeBus.routeId;
+    const routeCoords = activeBus.routeCoords;
+    
+    // Guard 2: No route assigned to this bus
+    if (!activeRouteId || !routeCoords || !Array.isArray(routeCoords)) {
+      if (lastDrawnRouteRef.current) {
+        webViewRef.current?.postMessage(JSON.stringify({ type: "CLEAR_ROUTE" }));
+        lastDrawnRouteRef.current = null;
+      }
       return;
     }
     
-    // Guard 3: Cancelled fetch tracking
-    let isCancelled = false;
+    // Guard 3: Skip if same bus+route already drawn (prevents redraw spam)
+    const routeKey = `${activeBusId}:${activeRouteId}`;
+    if (lastDrawnRouteRef.current === routeKey) {
+      console.log("[Route Corridor] Skip - already drawn:", routeKey);
+      return;
+    }
     
-    // Fetch route geometry from backend
-    const fetchAndDrawRoute = async () => {
-      try {
-        console.log("[Route Corridor] Fetching route:", activeRouteId);
-        const response = await fetch(`${API_BASE_URL}/routes/${activeRouteId}`);
-        
-        // Guard: Request was cancelled or component unmounted
-        if (isCancelled) {
-          console.log("[Route Corridor] Fetch cancelled, ignoring result");
-          return;
-        }
-        
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        
-        const data = await response.json();
-        
-        // Guard: Check again after async
-        if (isCancelled) {
-          console.log("[Route Corridor] Fetch cancelled after response");
-          return;
-        }
-        
-        if (!data.route?.coordinates) {
-          console.log("[Route Corridor] No coordinates in route data");
-          return;
-        }
-
-        // Guard: Final check before draw
-        if (lastDrawnRouteRef.current === activeRouteId) {
-          console.log("[Route Corridor] Skip draw - race condition");
-          return;
-        }
-
-        // Send DRAW_ROUTE to WebView
-        webViewRef.current.postMessage(JSON.stringify({
-          type: "DRAW_ROUTE",
-          routeId: activeRouteId,
-          routeColor: activeBus.routeColor || data.route.color || "#2563eb",
-          coordinates: data.route.coordinates,
-        }));
-        
-        // Mark as drawn
-        lastDrawnRouteRef.current = activeRouteId;
-        console.log("[Route Corridor] Drawn route:", activeRouteId);
-      } catch (err) {
-        if (!isCancelled) {
-          console.error("[Route Corridor] Failed to fetch route:", err.message);
-        }
-      }
-    };
-
-    fetchAndDrawRoute();
+    // Send DRAW_ROUTE to WebView with backend-provided coordinates
+    webViewRef.current.postMessage(JSON.stringify({
+      type: "DRAW_ROUTE",
+      busId: activeBusId,
+      routeId: activeRouteId,
+      routeColor: activeBus.routeColor || "#2563eb",
+      coordinates: routeCoords,
+    }));
     
-    // Cleanup: mark as cancelled if effect re-runs or unmounts
+    // Mark as drawn (track by busId:routeId combo)
+    lastDrawnRouteRef.current = routeKey;
+    console.log("[Route Corridor] Drew route:", routeKey, "with", routeCoords.length, "points");
+    
+    // Cleanup: clear route when effect re-runs with different bus/route
     return () => {
-      isCancelled = true;
+      // Route will be cleared by next effect run or component unmount
     };
   }, [followBusId, selectedBusId, buses]); // Dependencies: only bus selection/follow changes
 
@@ -578,6 +548,24 @@ export default function FullMapScreen({ route }) {
             font-size: 12px;
             color: #666;
             margin: 4px 0;
+          }
+          .bus-popup-current-stop {
+            color: #007AFF;
+            font-weight: 500;
+          }
+          .bus-popup-next-stop {
+            color: #10B981;
+            font-weight: 500;
+          }
+          .bus-popup-section {
+            margin-bottom: 8px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #f0f0f0;
+          }
+          .bus-popup-section:last-child {
+            border-bottom: none;
+            margin-bottom: 0;
+            padding-bottom: 0;
           }
           /* Toggle Switch */
           .follow-toggle { display: flex; align-items: center; margin-top: 8px; cursor: pointer; }
@@ -1000,6 +988,22 @@ export default function FullMapScreen({ route }) {
           </svg>
         </button>
         <script>
+          // GLOBAL ERROR HANDLER - Catch WebView crashes and report to RN
+          window.onerror = function(message, source, lineno, colno, error) {
+            console.error("[WEBVIEW ERROR]", message, "at line", lineno, "col", colno);
+            if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({
+                type: "WEBVIEW_ERROR",
+                message: message,
+                source: source,
+                lineno: lineno,
+                colno: colno,
+                stack: error && error.stack ? error.stack : null
+              }));
+            }
+            return true; // Prevent default error handling
+          };
+          
           document.addEventListener("DOMContentLoaded", function() {
             console.log("[WEBVIEW] DOMContentLoaded - Initializing...");
 
@@ -1322,15 +1326,19 @@ export default function FullMapScreen({ route }) {
             }
 
             // 3a) CREATE POPUP HTML (dynamic follow/unfollow)
-            // SPEEDOMETER UPDATE FUNCTION - UI only, no calculations
+            // SPEEDOMETER UPDATE FUNCTION - Backend-authoritative speed only
             function updateSpeedometer(busData) {
-              if (!busData || typeof busData.speed === 'undefined') return;
+              if (!busData) return;
+              
+              // Use backend-derived speed (stable) with fallback to raw GPS speed
+              const displaySpeed = Number.isFinite(busData.derivedSpeed)
+                ? Math.round(busData.derivedSpeed)
+                : Math.round((busData.speed || 0) * 3.6);
               
               const el = document.getElementById('speedometer');
               if (!el) return;
               
-              const speed = Math.round(busData.speed || 0);
-              el.innerHTML = 'Speed: ' + speed + ' km/h';
+              el.innerHTML = 'Speed: ' + displaySpeed + ' km/h';
               el.style.display = 'block';
             }
             
@@ -1355,10 +1363,11 @@ export default function FullMapScreen({ route }) {
               const direction = bus.direction || null;
               const tripId = bus.tripId || null;
               
-              // Speed (always show if available)
-              const speedKmh = bus.speed !== undefined 
-                ? Math.round(bus.speed * 3.6) 
-                : null;
+              // Speed - Backend-authoritative (derivedSpeed from backend, fallback to raw GPS)
+              const displaySpeed = Number.isFinite(bus.derivedSpeed)
+                ? Math.round(bus.derivedSpeed)
+                : (bus.speed !== undefined ? Math.round(bus.speed * 3.6) : null);
+              const speedKmh = displaySpeed;
               
               // Tracking status
               const isTracking = bus.trackingActive !== false;
@@ -1371,6 +1380,10 @@ export default function FullMapScreen({ route }) {
               const currentStopIndex = prog.currentStopIndex !== undefined ? prog.currentStopIndex : null;
               const nextStopIndex = prog.nextStopIndex !== undefined ? prog.nextStopIndex : null;
               const remainingDistanceKm = prog.remainingDistanceKm !== undefined ? prog.remainingDistanceKm : null;
+              // Live stop progression fields
+              const currentStopName = prog.currentStopName || null;
+              const nextStopName = prog.nextStopName || null;
+              const nextStopEtaMinutes = prog.nextStopEtaMinutes !== undefined ? prog.nextStopEtaMinutes : null;
               
               // Build route section
               let routeHtml = '';
@@ -1391,19 +1404,29 @@ export default function FullMapScreen({ route }) {
                 metaHtml += '<div class="bus-popup-row bus-popup-trip">ID: ' + tripId.slice(-6) + '</div>';
               }
               
-              // Build progression section
+              // Build live stop progression section (backend-driven)
               let progressHtml = '';
-              if (progressPercent !== null) {
-                progressHtml += '<div class="bus-popup-row">Progress: ' + progressPercent + '%</div>';
+              if (currentStopName) {
+                progressHtml += '<div class="bus-popup-row bus-popup-current-stop"><strong>Current:</strong> ' + escapeText(currentStopName) + '</div>';
               }
-              if (etaMinutes !== null) {
-                progressHtml += '<div class="bus-popup-row">ETA: ' + etaMinutes + ' min</div>';
+              if (nextStopName) {
+                const etaText = nextStopEtaMinutes !== null ? ' (' + nextStopEtaMinutes + ' min)' : '';
+                progressHtml += '<div class="bus-popup-row bus-popup-next-stop"><strong>Next:</strong> ' + escapeText(nextStopName) + etaText + '</div>';
               }
-              if (currentStopIndex !== null && nextStopIndex !== null && nextStopIndex >= 0) {
-                progressHtml += '<div class="bus-popup-row">Next Stop: #' + (nextStopIndex + 1) + '</div>';
-              }
-              if (remainingDistanceKm !== null) {
-                progressHtml += '<div class="bus-popup-row">Remaining: ' + remainingDistanceKm.toFixed(1) + ' km</div>';
+              // Fallback to legacy progression display if stop names not available
+              if (!currentStopName && !nextStopName) {
+                if (progressPercent !== null) {
+                  progressHtml += '<div class="bus-popup-row">Progress: ' + progressPercent + '%</div>';
+                }
+                if (etaMinutes !== null) {
+                  progressHtml += '<div class="bus-popup-row">ETA: ' + etaMinutes + ' min</div>';
+                }
+                if (currentStopIndex !== null && nextStopIndex !== null && nextStopIndex >= 0) {
+                  progressHtml += '<div class="bus-popup-row">Next Stop: #' + (nextStopIndex + 1) + '</div>';
+                }
+                if (remainingDistanceKm !== null) {
+                  progressHtml += '<div class="bus-popup-row">Remaining: ' + remainingDistanceKm.toFixed(1) + ' km</div>';
+                }
               }
               
               return '<div class="bus-popup">' +
@@ -1419,16 +1442,22 @@ export default function FullMapScreen({ route }) {
               '</div>';
             }
 
-            // 3b) ETA CALCULATION
+            // 3b) ETA CALCULATION - Backend-authoritative speed
             function calculateETA(bus, user) {
-              if (!bus.speed || bus.speed < 5) return null;
+              // Use backend-derived speed (stable) with fallback to raw GPS speed
+              const speedMps = Number.isFinite(bus.derivedSpeed)
+                ? (bus.derivedSpeed / 3.6)  // Convert km/h to m/s
+                : bus.speed;
+              
+              if (!speedMps || speedMps < (5 / 3.6)) return null;
+              
               const R = 6371000;
               const dLat = (user.lat - bus.lat) * Math.PI / 180;
               const dLng = (user.lng - bus.lng) * Math.PI / 180;
               const a = Math.sin(dLat/2)**2 + Math.cos(bus.lat * Math.PI/180) * Math.cos(user.lat * Math.PI/180) * Math.sin(dLng/2)**2;
               const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
               const distance = R * c;
-              const eta = distance / (bus.speed * (1000/3600));
+              const eta = distance / speedMps;
               return Math.round(eta / 60);
             }
 
@@ -1526,9 +1555,9 @@ export default function FullMapScreen({ route }) {
                     console.log("[WEBVIEW] Cancelled offline timeout for revived bus:", id);
                   }
                   
-                  // 1. Update position (with smooth animation)
-                  updateBusPosition(marker, id, bus.lat, bus.lng);
-                  
+                  // Update marker position with smooth interpolation
+                  updateBusPosition(marker, latlng, true);
+
                   // 2. Update heading (direction rotation only, with smoothing)
                   if (bus.heading !== undefined && bus.heading !== marker.__busData?.heading) {
                     updateBusHeading(marker, bus.heading);
@@ -1558,7 +1587,7 @@ export default function FullMapScreen({ route }) {
                     marker.__isFollowing = isFollowing;
                     
                     // Update speedometer when follow state changes
-                    if (isFollowing && bus.speed !== undefined) {
+                    if (isFollowing && (bus.derivedSpeed !== undefined || bus.speed !== undefined)) {
                       updateSpeedometer(bus);
                     }
                   }
@@ -1611,14 +1640,21 @@ export default function FullMapScreen({ route }) {
                     marker.setZIndexOffset(1000); // Normal bus priority
                   }
 
-                  // 12. Event-driven follow: camera tracks bus
+                  // 12. Event-driven follow: camera tracks bus (use snapped coords if available)
                   if (window.__followBusId === id && !window.__isUserInteracting) {
-                    throttledFollow(bus.lat, bus.lng);
+                    const followLat = bus.snappedLat !== undefined && bus.snappedLat !== null ? bus.snappedLat : bus.lat;
+                    const followLng = bus.snappedLng !== undefined && bus.snappedLng !== null ? bus.snappedLng : bus.lng;
+                    throttledFollow(followLat, followLng);
                   }
 
                 } else {
                   // CREATE NEW MARKER - only once per bus
-                  const busData = { ...bus, id, eta };
+                  // Use snapped coordinates if available, otherwise raw GPS
+                  const displayLat = bus.snappedLat !== undefined && bus.snappedLat !== null ? bus.snappedLat : bus.lat;
+                  const displayLng = bus.snappedLng !== undefined && bus.snappedLng !== null ? bus.snappedLng : bus.lng;
+                  const latlng = [displayLat, displayLng];
+                  
+                  const busData = { ...bus, id, eta, lat: displayLat, lng: displayLng };
                   
                   // Create production-grade divIcon with route color
                   const busIcon = createBusMarkerIcon(bus.routeColor, bus.routeName);
@@ -1766,6 +1802,10 @@ window.__busStopMarkers = {};
 window.__stopBusMap = {}; // stopId → [busIds]
 window.__highlightedStopId = null; // Currently highlighted stop
 window.__activeRouteStopId = null; // Persist route highlight across re-renders
+window.__activeRouteLine = null; // Active route corridor polyline (single)
+window.__activeRouteId = null; // Currently displayed route ID
+window.__activeBusId = null; // Bus ID that owns the active route
+window.__routeFittedOnce = false; // Prevent repeated fitBounds
 window.__lastNearestDistance = Infinity; // For hysteresis
 window.__nearestStopMarker = null; // Direct reference to nearest stop marker
 window.__nearestStopData = null; // Stop data for nearest stop
@@ -2437,6 +2477,7 @@ window.map.on("zoomend", function() {
                     
                     window.__activeRouteLine = routeLine;
                     window.__activeRouteId = data.routeId;
+                    window.__activeBusId = data.busId; // Track which bus owns this route
                     
                     // One-time viewport fit: only fit on new route, not during GPS updates
                     if (isNewRoute) {
@@ -2484,6 +2525,7 @@ window.map.on("zoomend", function() {
                     window.map.removeLayer(window.__activeRouteLine);
                     window.__activeRouteLine = null;
                     window.__activeRouteId = null;
+                    window.__activeBusId = null; // Clear bus ownership
                     window.__routeFittedOnce = false; // Reset to allow refitting on next route
                     console.log("[WEBVIEW] CLEAR_ROUTE: removed route corridor");
                   }
@@ -2762,6 +2804,16 @@ window.map.on("zoomend", function() {
                     clearTimeout(window.__offlineTimeouts[data.busId]);
                     delete window.__offlineTimeouts[data.busId];
                     console.log("[WEBVIEW] Cleared pending offline timeout for:", data.busId);
+                  }
+
+                  // Clear route corridor if this was the active followed bus
+                  if (data.busId && window.__activeBusId === data.busId && window.__activeRouteLine) {
+                    window.map.removeLayer(window.__activeRouteLine);
+                    window.__activeRouteLine = null;
+                    window.__activeRouteId = null;
+                    window.__activeBusId = null;
+                    window.__routeFittedOnce = false;
+                    console.log("[WEBVIEW] Cleared route corridor for offline bus:", data.busId);
                   }
 
                   // Apply offline transition before removal

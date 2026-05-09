@@ -30,6 +30,7 @@ const TOKEN_KEY = "@auth_token";
 global.bgBusId = null;
 global.bgToken = null;
 global.bgLastLocation = null; // { latitude, longitude, timestamp }
+global.bgLastSentTimestamp = null; // Last time we sent an update (for heartbeat)
 // SOS freeze state - stops location updates when SOS is active
 global.bgSosActive = false;
 // Background task tracking flag - single source of truth
@@ -40,8 +41,9 @@ let isCheckingSOS = false;
 let lastRequestId = 0;
 
 // Constants for GPS filtering
-const DUPLICATE_THRESHOLD_METERS = 10; // Skip if moved less than 10m (prevents GPS drift noise)
+const GPS_JITTER_THRESHOLD_METERS = 10; // Skip if moved less than 10m (prevents GPS drift noise)
 const EXTREME_JUMP_THRESHOLD_METERS = 1000; // Skip if jumped more than 1km
+const FORCE_UPDATE_INTERVAL_MS = 15000; // Force heartbeat update every 15 seconds even if stopped
 
 // Helper: async delay (replaces setTimeout)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -147,17 +149,23 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
       return;
     }
 
-    // Skip duplicate coordinates (no significant movement)
+    // GPS JITTER FILTER with HEARTBEAT: Skip low-distance updates unless forced
     const lastLoc = global.bgLastLocation;
     if (lastLoc && Number.isFinite(lastLoc.latitude) && Number.isFinite(lastLoc.longitude)) {
       const distance = haversineMeters(lastLoc.latitude, lastLoc.longitude, latitude, longitude);
-      if (distance < DUPLICATE_THRESHOLD_METERS) {
-        console.log("[BG TASK] Duplicate coordinates (moved " + distance.toFixed(1) + "m), skipping");
+      const now = Date.now();
+
+      // Force heartbeat update every 15 seconds even if stopped (maintains derivedSpeed stability)
+      const shouldForceUpdate = !global.bgLastSentTimestamp || (now - global.bgLastSentTimestamp) > FORCE_UPDATE_INTERVAL_MS;
+
+      if (distance < GPS_JITTER_THRESHOLD_METERS && !shouldForceUpdate) {
+        console.log(`[BG TASK] Duplicate coordinates (${distance.toFixed(1)}m), skipping`);
         return;
       }
+
       // Filter extreme GPS jumps (>1km in one update)
       if (distance > EXTREME_JUMP_THRESHOLD_METERS) {
-        console.log("[BG TASK] Extreme GPS jump (" + distance.toFixed(0) + "m), skipping");
+        console.log(`[BG TASK] Extreme GPS jump (${distance.toFixed(0)}m), skipping`);
         return;
       }
     }
@@ -208,11 +216,12 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
 
         // Log each send attempt for debugging
         console.log("DRIVER LOCATION:", latitude.toFixed(6), longitude.toFixed(6));
-      console.log("[BG TASK] Sending location:", latitude.toFixed(6), longitude.toFixed(6), "busId:", busId);
+        console.log("[BG TASK] Sending location update:", latitude.toFixed(6), longitude.toFixed(6), "speed:", (finalSpeed * 3.6).toFixed(1), "km/h");
 
         if (response.ok) {
           console.log("[BG TASK] Sent successfully:", latitude.toFixed(6), longitude.toFixed(6));
-          // Update last location after successful send
+          // Update heartbeat timestamp and last location after successful send
+          global.bgLastSentTimestamp = Date.now();
           global.bgLastLocation = { latitude, longitude, timestamp: Date.now() };
           return;
         } else if (response.status === 401) {
@@ -240,7 +249,8 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
           });
           if (response.ok) {
             console.log("[BG TASK] Retry success:", latitude.toFixed(6), longitude.toFixed(6));
-            // Update last location after successful retry
+            // Update heartbeat timestamp and last location after successful retry
+            global.bgLastSentTimestamp = Date.now();
             global.bgLastLocation = { latitude, longitude, timestamp: Date.now() };
           } else if (response.status === 401) {
             console.log("[BG TASK] Retry failed: Token expired (401)");

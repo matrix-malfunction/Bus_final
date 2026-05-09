@@ -100,15 +100,26 @@ export function BusProvider({ children }) {
           busId: data.busId,
           lat: data.latitude,
           lng: data.longitude,
-          speed: data.speed ?? 0,  // Include speed from backend
+          snappedLat: data.snappedLat ?? null,  // Snapped coordinates (if within route corridor)
+          snappedLng: data.snappedLng ?? null,
+          isSnapped: data.isSnapped || false,
+          distanceFromRoute: data.distanceFromRoute ?? null,
+          speed: data.speed ?? 0,  // Raw GPS speed from backend (m/s)
+          derivedSpeed: data.derivedSpeed ?? null,  // Backend-derived stable speed (km/h)
           trackingActive: data.trackingActive !== false,
           lastUpdate: Date.now(),
           // Route data from backend (if assigned)
           routeId: data.routeId || null,
           routeName: data.routeName || null,
           routeColor: data.routeColor || null,
+          routeCoords: data.routeCoords || null,  // Active route corridor coordinates
           direction: data.direction || null,
           tripId: data.tripId || null,
+          // Progression data from backend
+          currentStopName: data.currentStopName || null,
+          nextStopName: data.nextStopName || null,
+          nextStopEtaMinutes: data.nextStopEtaMinutes ?? null,
+          routeProgressIndex: data.routeProgressIndex ?? null,
         };
         const newBuses = { ...prevBuses };
         newBuses[data.busId] = busData;  // Direct assignment, no merge

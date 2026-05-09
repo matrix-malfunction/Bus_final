@@ -1584,7 +1584,7 @@ const HomeScreen = () => {
       {followBusId && followedBus && (
         <Speedometer
           key={followBusId}
-          speed={followedBus.speed}
+          speed={Number.isFinite(followedBus.derivedSpeed) ? followedBus.derivedSpeed : (followedBus.speed ? Math.round(followedBus.speed * 3.6) : 0)}
         />
       )}
     </SafeAreaView>

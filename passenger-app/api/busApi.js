@@ -163,7 +163,8 @@ export function expandBusData(data) {
     busId: data.busId ?? data.i ?? data._id,
     lat,
     lng,
-    speed: data.speed ?? data.s,
+    speed: data.speed ?? data.s,  // Raw GPS speed (m/s)
+    derivedSpeed: data.derivedSpeed ?? data.ds,  // Backend-derived stable speed (km/h)
     heading: data.heading ?? data.h,
     route: data.route ?? data.r,
     timestamp: data.timestamp ?? data.lastUpdate
