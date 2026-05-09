@@ -32,7 +32,8 @@ export const BusContext = createContext({
   socket: null,
   followBusId: null,
   setFollowBusId: () => {},
-  busStops: STATIC_STOPS
+  busStops: STATIC_STOPS,
+  busProgress: {}
 });
 
 export const useBus = () => useContext(BusContext);
@@ -45,6 +46,7 @@ export function BusProvider({ children }) {
   const [followBusId, setFollowBusId] = useState(null);
   const [userLocation, setUserLocation] = useState(null);
   const [busStops, setBusStops] = useState([]); // Will be populated from socket
+  const [busProgress, setBusProgress] = useState({}); // Bus progression state
 
   useEffect(() => {
     const newSocket = io(API_BASE_URL);
@@ -53,6 +55,15 @@ export function BusProvider({ children }) {
     // Listen for BUS_LOCATION_UPDATE from backend
     newSocket.on("BUS_LOCATION_UPDATE", (data) => {
       console.log("[BusContext] BUS_LOCATION_UPDATE received:", data);
+      
+      // Verify route metadata
+      console.log("[PASSENGER ROUTE UPDATE]", {
+        busId: data.busId,
+        routeId: data.routeId,
+        routeName: data.routeName,
+        direction: data.direction,
+        tripId: data.tripId,
+      });
       
       if (!data || !data.busId) {
         console.log("[BusContext] Invalid data, skipping");
@@ -68,7 +79,13 @@ export function BusProvider({ children }) {
           lng: data.longitude,
           speed: data.speed ?? 0,  // Include speed from backend
           trackingActive: data.trackingActive !== false,
-          lastUpdate: Date.now()
+          lastUpdate: Date.now(),
+          // Route data from backend (if assigned)
+          routeId: data.routeId || null,
+          routeName: data.routeName || null,
+          routeColor: data.routeColor || null,
+          direction: data.direction || null,
+          tripId: data.tripId || null,
         };
         const newBuses = { ...prevBuses };
         newBuses[data.busId] = busData;  // Direct assignment, no merge
@@ -87,6 +104,12 @@ export function BusProvider({ children }) {
         console.log("[FLOW] Bus removed:", busId, "Remaining:", Object.keys(updated));
         return updated;
       });
+      // Clear progression for offline bus
+      setBusProgress((prevProgress) => {
+        const updated = { ...prevProgress };
+        delete updated[busId];
+        return updated;
+      });
       // Reset follow if this bus was followed
       setFollowBusId(prev => (prev === busId ? null : prev));
     });
@@ -100,8 +123,38 @@ export function BusProvider({ children }) {
       }
     });
 
+    // Listen for BUS_PROGRESS_UPDATE from backend
+    newSocket.on("BUS_PROGRESS_UPDATE", (data) => {
+      console.log("[BusContext] BUS_PROGRESS_UPDATE received:", data);
+      
+      if (!data || !data.busId) {
+        console.log("[BusContext] Invalid progress data, skipping");
+        return;
+      }
+      
+      setBusProgress((prevProgress) => ({
+        ...prevProgress,
+        [data.busId]: {
+          tripId: data.tripId,
+          routeId: data.routeId,
+          currentStopIndex: data.currentStopIndex,
+          nextStopIndex: data.nextStopIndex,
+          passedStopIds: data.passedStopIds,
+          remainingDistanceKm: data.remainingDistanceKm,
+          progressPercent: data.progressPercent,
+          etaMinutes: data.etaMinutes,
+          avgSpeedKmh: data.avgSpeedKmh,
+          lastUpdate: Date.now()
+        }
+      }));
+    });
+
+    // Cleanup socket listeners on unmount
     return () => {
-      newSocket.disconnect();
+      newSocket.off("BUS_LOCATION_UPDATE");
+      newSocket.off("BUS_OFFLINE");
+      newSocket.off("BUS_PROGRESS_UPDATE");
+      newSocket.close();
     };
   }, []);
 
@@ -114,7 +167,8 @@ export function BusProvider({ children }) {
     setFollowBusId,
     userLocation,
     setUserLocation,
-    busStops // Now from socket, not hardcoded
+    busStops, // Now from socket, not hardcoded
+    busProgress // Bus progression state from backend
   };
 
   return <BusContext.Provider value={value}>{children}</BusContext.Provider>;

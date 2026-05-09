@@ -4,6 +4,7 @@ import { Button, SafeAreaView, StyleSheet, Text, TextInput, View } from "react-n
 import { NavigationContainer, useNavigation, useRoute } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import DriverTrackingScreen from "./DriverTrackingScreen";
+import RouteSelectionScreen from "./RouteSelectionScreen";
 
 // PRODUCTION BACKEND URL - must use HTTPS for Android APK
 const API_BASE_URL = "https://bus-tracking-backend-6htm.onrender.com";
@@ -71,9 +72,9 @@ function LoginScreen() {
         return;
       }
 
-      setStatus(`Logged in as ${data.user.name}. You can now send location.`);
+      setStatus(`Logged in as ${data.user.name}. Select your route to continue.`);
       console.log("Driver login success");
-      navigation.replace("Tracking", { token: data.token });
+      navigation.replace("RouteSelection", { token: data.token });
     } catch (error) {
       console.log("Driver login error:", error);
       setStatus("Network error during login");
@@ -106,9 +107,15 @@ function LoginScreen() {
 
 function TrackingScreen() {
   const route = useRoute();
-  const { token } = route.params || {};
+  const { token, routeId, routeName, routeColor, direction } = route.params || {};
 
-  return <DriverTrackingScreen token={token} />;
+  return <DriverTrackingScreen 
+    token={token} 
+    routeId={routeId}
+    routeName={routeName}
+    routeColor={routeColor}
+    direction={direction}
+  />;
 }
 
 export default function App() {
@@ -116,6 +123,7 @@ export default function App() {
     <NavigationContainer>
       <Stack.Navigator screenOptions={{ headerShown: false }}>
         <Stack.Screen name="Login" component={LoginScreen} />
+        <Stack.Screen name="RouteSelection" component={RouteSelectionScreen} />
         <Stack.Screen name="Tracking" component={TrackingScreen} />
       </Stack.Navigator>
     </NavigationContainer>

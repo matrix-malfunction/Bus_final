@@ -19,12 +19,13 @@ export default function FullMapScreen({ route }) {
   const webViewRef = useRef(null);
   const lastUserLocationRef = useRef(null); // Cache for resend on WebView load
   const busStopsRef = useRef(null); // Cache bus stops for resend
+  const lastDrawnRouteRef = useRef(null); // Track last drawn route to prevent redraw spam
   const [webViewReady, setWebViewReady] = useState(false);
   const [showNearestRoute, setShowNearestRoute] = useState(false);
 
   // Default center (Chennai) - prevents crash when no route params
   const DEFAULT_CENTER = { latitude: 13.0827, longitude: 80.2707 };
-  const { buses: contextBuses, socket, followBusId, setFollowBusId, setUserLocation, busStops } = useBus();
+  const { buses: contextBuses, socket, followBusId, setFollowBusId, setUserLocation, busStops, busProgress } = useBus();
   const { buses: routeBuses, userLocation: routeUserLocation, center: routeCenter, focusStop, userLocation: navUserLocation } = route?.params || {};
 
   // Convert context buses (object) to array and merge with route buses
@@ -41,17 +42,29 @@ export default function FullMapScreen({ route }) {
         const latitude = toFiniteCoordinate(bus?.latitude ?? bus?.lat);
         const longitude = toFiniteCoordinate(bus?.longitude ?? bus?.lng);
         if (latitude === null || longitude === null) return null;
+        
+        // Merge progression data if available
+        const progress = bus?.busId ? busProgress[bus.busId] : null;
+        
         return {
           ...bus,
           latitude,
           longitude,
           lat: latitude,
+          // Add progression data for popup display
+          ...(progress && {
+            currentStopIndex: progress.currentStopIndex,
+            nextStopIndex: progress.nextStopIndex,
+            etaMinutes: progress.etaMinutes,
+            progressPercent: progress.progressPercent,
+            remainingDistanceKm: progress.remainingDistanceKm,
+          }),
           lng: longitude,
           busId: bus.busId || bus._id
         };
       })
       .filter(Boolean);
-  }, [routeBuses, contextBuses]);
+  }, [routeBuses, contextBuses, busProgress]);
 
   const center =
     routeCenter &&
@@ -112,12 +125,15 @@ export default function FullMapScreen({ route }) {
         }
 
         // ALWAYS resend BUS_UPDATE on MAP_READY (recovery mechanism)
-        // Use 50ms delay to ensure state is fresh, then read from contextBuses directly
+        // Use 50ms delay to ensure state is fresh
         setTimeout(() => {
           if (!webViewRef.current) return;
 
-          // Get latest buses directly from context to avoid stale closure
-          const latestBuses = Object.values(contextBuses || {});
+          // Get latest buses and enrich with progression data
+          const latestBuses = Object.values(contextBuses || {}).map(bus => ({
+            ...bus,
+            progression: busProgress?.[bus.busId] || null,
+          }));
           console.log("[FullMap RN] Sending BUS_UPDATE after MAP_READY:", latestBuses.length, "buses");
 
           webViewRef.current.postMessage(
@@ -242,6 +258,113 @@ export default function FullMapScreen({ route }) {
     );
   }, [followBusId, webViewReady]);
 
+  // Send STOP_PROGRESSION to WebView when busProgress changes
+  // Backend-driven next stop highlighting (render-only in WebView)
+  useEffect(() => {
+    if (!webViewRef.current || !webViewReady) return;
+    if (!busProgress || Object.keys(busProgress).length === 0) return;
+
+    // Send progression updates for each bus with valid next stop
+    Object.entries(busProgress).forEach(([busId, progress]) => {
+      if (progress?.nextStopIndex !== undefined && progress.nextStopIndex >= 0) {
+        webViewRef.current.postMessage(
+          JSON.stringify({
+            type: "STOP_PROGRESSION",
+            busId,
+            nextStopIndex: progress.nextStopIndex,
+            currentStopIndex: progress.currentStopIndex,
+            etaMinutes: progress.etaMinutes,
+          })
+        );
+        console.log("[FullMap RN] STOP_PROGRESSION sent for", busId, "next stop:", progress.nextStopIndex);
+      }
+    });
+  }, [busProgress, webViewReady]);
+
+  // Route corridor: fetch and draw when active route changes (NOT on GPS updates)
+  useEffect(() => {
+    // Determine active route from followed or selected bus
+    const activeBusId = followBusId || selectedBusId;
+    const activeBus = buses.find(b => b.busId === activeBusId || b.id === activeBusId);
+    const activeRouteId = activeBus?.routeId || null;
+    
+    // Guard 1: No active route - clear and exit
+    if (!activeRouteId || !webViewRef.current || !webViewReady) {
+      if (!activeRouteId && lastDrawnRouteRef.current) {
+        webViewRef.current?.postMessage(JSON.stringify({ type: "CLEAR_ROUTE" }));
+        lastDrawnRouteRef.current = null;
+      }
+      return;
+    }
+    
+    // Guard 2: Skip if same route already drawn (prevents redraw spam)
+    if (lastDrawnRouteRef.current === activeRouteId) {
+      console.log("[Route Corridor] Skip - already drawn:", activeRouteId);
+      return;
+    }
+    
+    // Guard 3: Cancelled fetch tracking
+    let isCancelled = false;
+    
+    // Fetch route geometry from backend
+    const fetchAndDrawRoute = async () => {
+      try {
+        console.log("[Route Corridor] Fetching route:", activeRouteId);
+        const response = await fetch(`${API_BASE_URL}/routes/${activeRouteId}`);
+        
+        // Guard: Request was cancelled or component unmounted
+        if (isCancelled) {
+          console.log("[Route Corridor] Fetch cancelled, ignoring result");
+          return;
+        }
+        
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        
+        const data = await response.json();
+        
+        // Guard: Check again after async
+        if (isCancelled) {
+          console.log("[Route Corridor] Fetch cancelled after response");
+          return;
+        }
+        
+        if (!data.route?.coordinates) {
+          console.log("[Route Corridor] No coordinates in route data");
+          return;
+        }
+
+        // Guard: Final check before draw
+        if (lastDrawnRouteRef.current === activeRouteId) {
+          console.log("[Route Corridor] Skip draw - race condition");
+          return;
+        }
+
+        // Send DRAW_ROUTE to WebView
+        webViewRef.current.postMessage(JSON.stringify({
+          type: "DRAW_ROUTE",
+          routeId: activeRouteId,
+          routeColor: activeBus.routeColor || data.route.color || "#2563eb",
+          coordinates: data.route.coordinates,
+        }));
+        
+        // Mark as drawn
+        lastDrawnRouteRef.current = activeRouteId;
+        console.log("[Route Corridor] Drawn route:", activeRouteId);
+      } catch (err) {
+        if (!isCancelled) {
+          console.error("[Route Corridor] Failed to fetch route:", err.message);
+        }
+      }
+    };
+
+    fetchAndDrawRoute();
+    
+    // Cleanup: mark as cancelled if effect re-runs or unmounts
+    return () => {
+      isCancelled = true;
+    };
+  }, [followBusId, selectedBusId, buses]); // Dependencies: only bus selection/follow changes
+
   // Send FOCUS_STOP to WebView when navigating from nearest stops
   useEffect(() => {
     if (!focusStop || !webViewRef.current) return;
@@ -287,6 +410,13 @@ export default function FullMapScreen({ route }) {
         console.log("[FullMap RN] Clearing follow for offline bus:", busId);
         setFollowBusId(null);
       }
+      
+      // Clear route corridor if this was the active bus
+      if ((followBusId === busId || selectedBusId === busId) && webViewRef.current && webViewReady) {
+        console.log("[FullMap RN] Clearing route corridor for offline bus:", busId);
+        webViewRef.current.postMessage(JSON.stringify({ type: "CLEAR_ROUTE" }));
+        lastDrawnRouteRef.current = null; // Reset to allow redraw if bus comes back online
+      }
     };
 
     socket.on("BUS_OFFLINE", handleBusOffline);
@@ -307,7 +437,7 @@ export default function FullMapScreen({ route }) {
       socket.off("BUS_OFFLINE", handleBusOffline);
       socket.off("SOS_ACKNOWLEDGED", handleSosAcknowledged);
     };
-  }, [socket, webViewReady, followBusId, setFollowBusId]);
+  }, [socket, webViewReady, followBusId, selectedBusId, setFollowBusId]);
 
   // Global event listener for BUS_OFFLINE from HomeScreen
   useEffect(() => {
@@ -535,6 +665,143 @@ export default function FullMapScreen({ route }) {
             fill: #333;
             pointer-events: none;
           }
+          
+          /* Production-Grade Bus Marker Architecture */
+          .bus-marker-container {
+            /* Reset Leaflet default positioning */
+          }
+          
+          .bus-marker {
+            position: relative;
+            width: 48px;
+            height: 60px;
+            pointer-events: none;
+            transform-origin: center center;
+            transition: transform 0.3s ease;
+          }
+          
+          /* Glow effect for followed bus */
+          .bus-marker__glow {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 56px;
+            height: 56px;
+            transform: translate(-50%, -50%);
+            background: radial-gradient(circle, rgba(0,122,255,0.4) 0%, transparent 70%);
+            border-radius: 50%;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            z-index: 1;
+          }
+          
+          .bus-marker--followed {
+            transform: scale(1.1);
+          }
+          
+          .bus-marker--followed .bus-marker__glow {
+            opacity: 1;
+          }
+          
+          /* Main bus body - transit pill style */
+          .bus-marker__body {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 2px;
+            padding: 4px 8px;
+            background: #2563eb;
+            border-radius: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            z-index: 2;
+            min-width: 40px;
+            height: 28px;
+            transition: background-color 0.3s ease;
+          }
+          
+          .bus-marker__icon {
+            font-size: 16px;
+            line-height: 1;
+          }
+          
+          .bus-marker__route {
+            font-size: 9px;
+            font-weight: 700;
+            color: white;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            white-space: nowrap;
+          }
+          
+          /* Direction arrow */
+          .bus-marker__direction {
+            position: absolute;
+            top: -8px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 14px;
+            color: #333;
+            text-shadow: 0 1px 2px rgba(255,255,255,0.8);
+            z-index: 3;
+            transition: transform 0.2s ease;
+            line-height: 1;
+          }
+          
+          /* ETA badge */
+          .bus-marker__eta-badge {
+            position: absolute;
+            bottom: -6px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #10b981;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 10px;
+            font-size: 9px;
+            font-weight: 600;
+            white-space: nowrap;
+            z-index: 3;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+            display: none;
+          }
+          
+          /* SOS ring animation */
+          .bus-marker__sos-ring {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 60px;
+            height: 60px;
+            border: 3px solid #ef4444;
+            border-radius: 50%;
+            z-index: 0;
+            display: none;
+            animation: sos-pulse 1s ease-out infinite;
+          }
+          
+          .bus-marker--sos .bus-marker__sos-ring {
+            display: block;
+          }
+          
+          @keyframes sos-pulse {
+            0% { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+            100% { transform: translate(-50%, -50%) scale(1.5); opacity: 0; }
+          }
+          
+          /* Offline state */
+          .bus-marker--offline {
+            opacity: 0.5;
+            filter: grayscale(50%);
+          }
+          
+          .bus-marker--offline .bus-marker__body {
+            background: #9ca3af !important;
+          }
         </style>
       </head>
       <body>
@@ -604,34 +871,146 @@ export default function FullMapScreen({ route }) {
             window.userLocation = null;
             window.__pendingBusStopRender = false;
 
-            // 3) BUS ICON with embedded speed badge (static - never recreated)
-            // Badge is hidden by default, shown/hidden via DOM manipulation only
-            const busIconWithBadge = L.divIcon({
-              html: '<div style="position:relative;">' +
-                      '<div style="font-size:28px;background:white;border-radius:50%;width:36px;height:36px;display:flex;align-items:center;justify-content:center;box-shadow:0 0 6px rgba(0,0,0,0.3);cursor:pointer;">🚌</div>' +
-                      '<div class="speed-badge" style="display:none;position:absolute;top:-20px;left:50%;transform:translateX(-50%);background:#007AFF;color:white;padding:2px 6px;border-radius:10px;font-size:11px;font-weight:bold;white-space:nowrap;z-index:1000;"></div>' +
-                    '</div>',
-              className: 'bus-marker-with-speed',
-              iconSize: [36, 50],
-              iconAnchor: [18, 36]
-            });
+            // 3) PRODUCTION-GRADE BUS MARKER ARCHITECTURE
+            // Layered divIcon with DOM mutation-only updates
+            // Supports: route color, heading, ETA, follow glow, SOS, offline states
             
-            // SPEED BADGE UPDATE FUNCTIONS
-            // Rebind element if missing (defensive)
-            function bindSpeedEl(marker) {
-              if (!marker.__speedEl) {
-                const el = marker.getElement();
-                if (el) {
-                  marker.__speedEl = el.querySelector('.speed-badge');
-                }
-              }
-              return marker.__speedEl;
+            // Build bus marker HTML using string concatenation (no nested template literals)
+            function buildBusMarkerHTML(color, shortName) {
+              return '<div class="bus-marker" data-bus-id="">' +
+                '<div class="bus-marker__glow"></div>' +
+                '<div class="bus-marker__body" style="background: ' + color + ';">' +
+                  '<span class="bus-marker__icon">🚌</span>' +
+                  '<span class="bus-marker__route">' + shortName + '</span>' +
+                '</div>' +
+                '<div class="bus-marker__direction" style="transform: rotate(0deg);">➤</div>' +
+                '<div class="bus-marker__eta-badge" style="display: none;">' +
+                  '<span class="eta-time">--</span>' +
+                '</div>' +
+                '<div class="bus-marker__sos-ring" style="display: none;"></div>' +
+              '</div>';
+            }
+
+            function createBusMarkerIcon(routeColor, routeName) {
+              const color = routeColor || '#2563eb';
+              const shortName = routeName ? routeName.substring(0, 3).toUpperCase() : 'BUS';
+              
+              return L.divIcon({
+                html: buildBusMarkerHTML(color, shortName),
+                className: 'bus-marker-container',
+                iconSize: [48, 60],
+                iconAnchor: [24, 30]
+              });
             }
             
-            // Speed thresholds (m/s)
-            const SPEED_MEDIUM = 5 / 3.6;   // ~1.39 m/s = 5 km/h
-            const SPEED_HIGH = 20 / 3.6;    // ~5.56 m/s = 20 km/h
-            const SPEED_VERY_HIGH = 40 / 3.6; // ~11.11 m/s = 40 km/h
+            // DOM element cache per marker for performance
+            function getMarkerElements(marker) {
+              if (!marker.__elements) {
+                const el = marker.getElement();
+                if (!el) return null;
+                const container = el.querySelector('.bus-marker');
+                if (!container) return null;
+                
+                marker.__elements = {
+                  container,
+                  glow: container.querySelector('.bus-marker__glow'),
+                  body: container.querySelector('.bus-marker__body'),
+                  direction: container.querySelector('.bus-marker__direction'),
+                  etaBadge: container.querySelector('.bus-marker__eta-badge'),
+                  etaTime: container.querySelector('.eta-time'),
+                  route: container.querySelector('.bus-marker__route'),
+                  sosRing: container.querySelector('.bus-marker__sos-ring')
+                };
+              }
+              return marker.__elements;
+            }
+            
+            // Update marker position (smooth animation ready)
+            function updateBusPosition(marker, lat, lng) {
+              marker.setLatLng([lat, lng]);
+            }
+            
+            // Update heading direction (rotation only)
+            function updateBusHeading(marker, heading) {
+              const els = getMarkerElements(marker);
+              if (els && els.direction && heading !== undefined) {
+                els.direction.style.transform = 'rotate(' + heading + 'deg)';
+              }
+            }
+            
+            // Update ETA badge (text only, show/hide)
+            function updateBusETA(marker, etaMinutes) {
+              const els = getMarkerElements(marker);
+              if (!els || !els.etaBadge) return;
+              
+              if (etaMinutes !== undefined && etaMinutes !== null && etaMinutes >= 0) {
+                els.etaTime.textContent = etaMinutes + 'm';
+                els.etaBadge.style.display = 'flex';
+              } else {
+                els.etaBadge.style.display = 'none';
+              }
+            }
+            
+            // Update follow state (CSS classes only)
+            function updateBusFollowState(marker, isFollowing) {
+              const els = getMarkerElements(marker);
+              if (!els || !els.container) return;
+              
+              if (isFollowing) {
+                els.container.classList.add('bus-marker--followed');
+                els.glow.style.opacity = '1';
+              } else {
+                els.container.classList.remove('bus-marker--followed');
+                els.glow.style.opacity = '0';
+              }
+            }
+            
+            // Update SOS state (CSS class + ring visibility)
+            function updateBusSOS(marker, isSOS) {
+              const els = getMarkerElements(marker);
+              if (!els || !els.container) return;
+              
+              if (isSOS) {
+                els.container.classList.add('bus-marker--sos');
+                els.sosRing.style.display = 'block';
+              } else {
+                els.container.classList.remove('bus-marker--sos');
+                els.sosRing.style.display = 'none';
+              }
+            }
+            
+            // Update offline state
+            function updateBusOffline(marker, isOffline) {
+              const els = getMarkerElements(marker);
+              if (!els || !els.container) return;
+              
+              if (isOffline) {
+                els.container.classList.add('bus-marker--offline');
+              } else {
+                els.container.classList.remove('bus-marker--offline');
+              }
+            }
+            
+            // Update route color (background only)
+            function updateBusRouteColor(marker, routeColor) {
+              const els = getMarkerElements(marker);
+              if (els && els.body && routeColor) {
+                els.body.style.background = routeColor;
+              }
+            }
+            
+            // Update route name text
+            function updateBusRouteName(marker, routeName) {
+              const els = getMarkerElements(marker);
+              if (els && els.route && routeName) {
+                els.route.textContent = routeName.substring(0, 3).toUpperCase();
+              }
+            }
+            
+            // Legacy speed badge functions (preserved for compatibility)
+            const SPEED_MEDIUM = 5 / 3.6;
+            const SPEED_HIGH = 20 / 3.6;
+            const SPEED_VERY_HIGH = 40 / 3.6;
             
             function getSpeedClass(speedMps) {
               if (speedMps === undefined || speedMps === null) return '';
@@ -642,66 +1021,16 @@ export default function FullMapScreen({ route }) {
             }
             
             function updateSpeedBadge(busId, speed) {
-              const marker = window.busMarkers[busId];
-              if (!marker) return;
-              
-              const speedEl = bindSpeedEl(marker);
-              if (!speedEl) return;
-              
-              if (window.__followBusId === busId) {
-                // Update text (placeholder if speed undefined)
-                speedEl.textContent = speed !== undefined ? Math.round(speed * 3.6) + ' km/h' : '-- km/h';
-                speedEl.style.display = 'block';
-                
-                // Remove old speed classes
-                speedEl.classList.remove('speed-low', 'speed-medium', 'speed-high', 'speed-very-high');
-                
-                // Add new speed class (only if speed defined)
-                if (speed !== undefined) {
-                  const newClass = getSpeedClass(speed);
-                  if (newClass) {
-                    speedEl.classList.add(newClass);
-                  }
-                }
-              }
+              // Handled by main marker update - legacy function preserved
             }
             
             function hideSpeedBadge(busId) {
-              const marker = window.busMarkers[busId];
-              if (!marker) return;
-              
-              const speedEl = bindSpeedEl(marker);
-              if (speedEl) {
-                speedEl.style.display = 'none';
-              }
+              // Handled by main marker update - legacy function preserved
             }
             
             function showSpeedBadge(busId) {
-              const marker = window.busMarkers[busId];
-              if (!marker) return;
-              
-              const speedEl = bindSpeedEl(marker);
-              if (!speedEl) return;
-              
-              const speed = marker.__busData?.speed;
-              
-              if (speed === undefined) {
-                // Speed not available yet - show placeholder
-                speedEl.textContent = '-- km/h';
-                speedEl.style.display = 'block';
-              } else {
-                // Speed available - use updateSpeedBadge for full styling
-                updateSpeedBadge(busId, speed);
-              }
+              // Handled by main marker update - legacy function preserved
             }
-            
-            // Legacy busIcon for fallback (not used with badge system)
-            const busIcon = L.divIcon({
-              html: '<div style="font-size:28px;background:white;border-radius:50%;width:36px;height:36px;display:flex;align-items:center;justify-content:center;box-shadow:0 0 6px rgba(0,0,0,0.3);cursor:pointer;">🚌</div>',
-              className: '',
-              iconSize: [36, 36],
-              iconAnchor: [18, 36]
-            });
 
             // SOS emergency icon
             const sosIcon = L.icon({
@@ -735,23 +1064,74 @@ export default function FullMapScreen({ route }) {
               }
             }
 
-            // Speed shown only for followed bus
+            // Route-aware popup with bus metadata and progression
             function createPopupHTML(bus) {
-              const eta = bus.eta ? Math.round(bus.eta) : "--";
               const isFollowing = window.__followBusId === (bus.busId || bus.id);
               const checkedAttr = isFollowing ? 'checked' : '';
               const labelText = isFollowing ? 'Following' : 'Follow';
-              const busId = bus.busId || bus.id;
+              const busId = bus.busId || bus.id || "Unknown";
               
-              // Speed visible only for followed bus
-              const speedHtml = isFollowing && bus.speed !== undefined
-                ? '<div class="bus-popup-row">Speed: ' + Math.round(bus.speed * 3.6) + ' km/h</div>'
-                : '';
+              // Route info (fallback gracefully if missing)
+              const routeName = bus.routeName || bus.route || null;
+              const direction = bus.direction || null;
+              const tripId = bus.tripId || null;
+              
+              // Speed (always show if available)
+              const speedKmh = bus.speed !== undefined 
+                ? Math.round(bus.speed * 3.6) 
+                : null;
+              
+              // Tracking status
+              const isTracking = bus.trackingActive !== false;
+              const trackingStatus = isTracking ? "Active" : "Paused";
+              
+              // Progression data (backend-driven) - support both direct and nested progression
+              const prog = bus.progression || bus;
+              const progressPercent = prog.progressPercent !== undefined ? prog.progressPercent : null;
+              const etaMinutes = prog.etaMinutes !== undefined ? prog.etaMinutes : null;
+              const currentStopIndex = prog.currentStopIndex !== undefined ? prog.currentStopIndex : null;
+              const nextStopIndex = prog.nextStopIndex !== undefined ? prog.nextStopIndex : null;
+              const remainingDistanceKm = prog.remainingDistanceKm !== undefined ? prog.remainingDistanceKm : null;
+              
+              // Build route section
+              let routeHtml = '';
+              if (routeName) {
+                routeHtml += '<div class="bus-popup-row bus-popup-route">' + routeName + '</div>';
+              }
+              if (direction) {
+                routeHtml += '<div class="bus-popup-row bus-popup-direction">' + direction + '</div>';
+              }
+              
+              // Build metadata section
+              let metaHtml = '';
+              if (speedKmh !== null) {
+                metaHtml += '<div class="bus-popup-row">Speed: ' + speedKmh + ' km/h</div>';
+              }
+              metaHtml += '<div class="bus-popup-row">Trip: ' + trackingStatus + '</div>';
+              if (tripId) {
+                metaHtml += '<div class="bus-popup-row bus-popup-trip">ID: ' + tripId.slice(-6) + '</div>';
+              }
+              
+              // Build progression section
+              let progressHtml = '';
+              if (progressPercent !== null) {
+                progressHtml += '<div class="bus-popup-row">Progress: ' + progressPercent + '%</div>';
+              }
+              if (etaMinutes !== null) {
+                progressHtml += '<div class="bus-popup-row">ETA: ' + etaMinutes + ' min</div>';
+              }
+              if (currentStopIndex !== null && nextStopIndex !== null && nextStopIndex >= 0) {
+                progressHtml += '<div class="bus-popup-row">Next Stop: #' + (nextStopIndex + 1) + '</div>';
+              }
+              if (remainingDistanceKm !== null) {
+                progressHtml += '<div class="bus-popup-row">Remaining: ' + remainingDistanceKm.toFixed(1) + ' km</div>';
+              }
               
               return '<div class="bus-popup">' +
-                '<div class="bus-popup-header">' + (bus.name || busId || "Bus") + '</div>' +
-                '<div class="bus-popup-row">ETA: ' + eta + ' min</div>' +
-                speedHtml +
+                '<div class="bus-popup-header">Bus: ' + busId + '</div>' +
+                (routeName || direction ? '<div class="bus-popup-section">' + routeHtml + '</div>' : '') +
+                '<div class="bus-popup-section">' + metaHtml + '</div>' +
+                (progressHtml ? '<div class="bus-popup-section bus-popup-progress">' + progressHtml + '</div>' : '') +
                 '<label class="follow-toggle">' +
                   '<input type="checkbox" ' + checkedAttr + ' data-bus-id="' + busId + '">' +
                   '<span class="toggle-slider"></span>' +
@@ -853,22 +1233,58 @@ export default function FullMapScreen({ route }) {
                 }
 
                 if (markers[id]) {
-                  // UPDATE EXISTING MARKER - no recreation
+                  // UPDATE EXISTING MARKER - DOM mutation only, no recreation
                   const marker = markers[id];
-                  marker.setLatLng(latlng);
-
-                  // Merge new data with existing (preserves references)
-                  marker.__busData = { ...marker.__busData, ...bus, id, eta };
-
-                  // Update popup using marker.__busData (single source)
-                  updateBusPopup(marker, marker.__busData);
-
-                  // Update speed badge using marker.__busData.speed (single source)
-                  if (marker.__busData.speed !== undefined) {
-                    updateSpeedBadge(id, marker.__busData.speed);
+                  
+                  // 1. Update position
+                  updateBusPosition(marker, bus.lat, bus.lng);
+                  
+                  // 2. Update heading (direction rotation only)
+                  if (bus.heading !== undefined && bus.heading !== marker.__busData?.heading) {
+                    updateBusHeading(marker, bus.heading);
                   }
-
-                  // Update z-index based on follow state
+                  
+                  // 3. Update route color (if changed)
+                  if (bus.routeColor !== marker.__busData?.routeColor) {
+                    updateBusRouteColor(marker, bus.routeColor);
+                  }
+                  
+                  // 4. Update route name (if changed)
+                  if (bus.routeName !== marker.__busData?.routeName) {
+                    updateBusRouteName(marker, bus.routeName);
+                  }
+                  
+                  // 5. Update ETA badge (if progression data available)
+                  const etaMinutes = bus.progression?.etaMinutes || bus.etaMinutes;
+                  if (etaMinutes !== undefined) {
+                    updateBusETA(marker, etaMinutes);
+                  }
+                  
+                  // 6. Update follow state (CSS classes only)
+                  const isFollowing = window.__followBusId === id;
+                  const wasFollowing = marker.__isFollowing;
+                  if (isFollowing !== wasFollowing) {
+                    updateBusFollowState(marker, isFollowing);
+                    marker.__isFollowing = isFollowing;
+                    
+                    // Update speedometer when follow state changes
+                    if (isFollowing && bus.speed !== undefined) {
+                      updateSpeedometer(bus);
+                    }
+                  }
+                  
+                  // 7. Update SOS state (if changed)
+                  if (bus.sos !== marker.__busData?.sos) {
+                    updateBusSOS(marker, bus.sos);
+                  }
+                  
+                  // 8. Merge data for popup updates
+                  marker.__busData = { ...marker.__busData, ...bus, id, eta };
+                  
+                  // 9. Update popup content (if open or following)
+                  updateBusPopup(marker, marker.__busData);
+                  
+                  // 10. Update z-index based on state
                   if (window.__followBusId === id) {
                     marker.setZIndexOffset(1000);
                   } else if (bus.sos) {
@@ -876,34 +1292,46 @@ export default function FullMapScreen({ route }) {
                   } else {
                     marker.setZIndexOffset(0);
                   }
-
-                  // Event-driven follow: camera tracks bus on location update
+                  
+                  // 11. Event-driven follow: camera tracks bus
                   if (window.__followBusId === id && !window.__isUserInteracting) {
                     throttledFollow(bus.lat, bus.lng);
                   }
 
                 } else {
-                  // CREATE NEW MARKER - only once (in busesPane for z-order)
+                  // CREATE NEW MARKER - only once per bus
                   const busData = { ...bus, id, eta };
-                  const marker = L.marker(latlng, { icon: busIconWithBadge, pane: 'busesPane' }).addTo(window.map);
                   
-                  // Cache speed element reference immediately
-                  const el = marker.getElement();
-                  if (el) {
-                    marker.__speedEl = el.querySelector('.speed-badge');
-                  }
-
+                  // Create production-grade divIcon with route color
+                  const busIcon = createBusMarkerIcon(bus.routeColor, bus.routeName);
+                  const marker = L.marker(latlng, { icon: busIcon, pane: 'busesPane' }).addTo(window.map);
+                  
+                  // Cache DOM element references for performance
+                  getMarkerElements(marker);
+                  
                   // Store full bus data on marker
                   marker.__busData = busData;
-
+                  marker.__isFollowing = false;
+                  
+                  // Initialize visual states
+                  if (bus.heading !== undefined) {
+                    updateBusHeading(marker, bus.heading);
+                  }
+                  if (bus.sos) {
+                    updateBusSOS(marker, true);
+                  }
+                  
                   // Show speed badge if this bus is already being followed
                   if (window.__followBusId === id) {
-                    showSpeedBadge(id);
-                  }
-
-                  // Update speedometer ONLY if this bus is being followed
-                  if (window.__followBusId === id && busData.speed !== undefined) {
+                    updateBusFollowState(marker, true);
+                    marker.__isFollowing = true;
                     updateSpeedometer(busData);
+                  }
+                  
+                  // Update ETA if available
+                  const etaMinutes = bus.progression?.etaMinutes || bus.etaMinutes;
+                  if (etaMinutes !== undefined) {
+                    updateBusETA(marker, etaMinutes);
                   }
 
                   // Click to select
@@ -921,7 +1349,7 @@ export default function FullMapScreen({ route }) {
                     closeOnClick: false
                   });
 
-                  // Set z-index
+                  // Set initial z-index
                   if (bus.sos) {
                     marker.setZIndexOffset(2000);
                   }
@@ -1013,6 +1441,23 @@ function createStopIcon(name) {
     className: '',
     iconSize: [80, 60],
     iconAnchor: [40, 60]
+  });
+}
+
+// Highlighted bus stop icon for next stop
+function createHighlightedStopIcon(name, etaMinutes) {
+  const etaLabel = etaMinutes !== undefined && etaMinutes !== null 
+    ? '<div class="stop-eta">ETA: ' + etaMinutes + ' min</div>' 
+    : '';
+  return L.divIcon({
+    html: '<div class="bus-stop-marker highlighted-stop">' +
+      '<div class="bus-stop-icon" style="background: #f59e0b; color: white; border-radius: 50%; padding: 4px;">📍</div>' +
+      '<div class="bus-stop-label">' + (name || 'Stop') + '</div>' +
+      etaLabel +
+      '</div>',
+    className: '',
+    iconSize: [100, 80],
+    iconAnchor: [50, 80]
   });
 }
 
@@ -1605,7 +2050,54 @@ window.map.on("zoomend", function() {
                   break;
 
                 case "DRAW_ROUTE":
-                  // Store route stop ID for persistent highlighting
+                  // Route corridor drawing (coordinates array)
+                  if (data.coordinates && Array.isArray(data.coordinates)) {
+                    // Skip if same route already active
+                    if (window.__activeRouteId === data.routeId && window.__activeRouteLine) {
+                      console.log("[WEBVIEW] DRAW_ROUTE: skip - same route active:", data.routeId);
+                      break;
+                    }
+                    
+                    // Check if this is a new route (for viewport fitting)
+                    const isNewRoute = window.__activeRouteId !== data.routeId;
+                    
+                    // Remove previous route line if exists
+                    if (window.__activeRouteLine) {
+                      window.map.removeLayer(window.__activeRouteLine);
+                      window.__activeRouteLine = null;
+                      window.__activeRouteId = null;
+                    }
+                    
+                    // Draw new route polyline
+                    const routeLine = L.polyline(data.coordinates, {
+                      color: data.routeColor || "#2563eb",
+                      weight: 5,
+                      opacity: 0.7,
+                    }).addTo(window.map);
+                    
+                    window.__activeRouteLine = routeLine;
+                    window.__activeRouteId = data.routeId;
+                    
+                    // One-time viewport fit: only fit on new route, not during GPS updates
+                    if (isNewRoute) {
+                      // Small delay to ensure polyline is fully rendered
+                      setTimeout(() => {
+                        if (window.__activeRouteLine && window.map) {
+                          window.map.fitBounds(
+                            routeLine.getBounds(),
+                            { padding: [40, 40], animate: true }
+                          );
+                          console.log("[WEBVIEW] DRAW_ROUTE: fitted viewport to route", data.routeId);
+                        }
+                      }, 100);
+                      window.__routeFittedOnce = true;
+                    }
+                    
+                    console.log("[WEBVIEW] DRAW_ROUTE: drew route corridor", data.routeId, "with", data.coordinates.length, "points");
+                    break;
+                  }
+                  
+                  // Store route stop ID for persistent highlighting (legacy)
                   if (data.stopId) {
                     window.__activeRouteStopId = data.stopId;
                     // Apply highlight immediately if marker exists
@@ -1627,7 +2119,16 @@ window.map.on("zoomend", function() {
                   break;
 
                 case "CLEAR_ROUTE":
-                  // Clear route highlight
+                  // Remove route corridor polyline
+                  if (window.__activeRouteLine) {
+                    window.map.removeLayer(window.__activeRouteLine);
+                    window.__activeRouteLine = null;
+                    window.__activeRouteId = null;
+                    window.__routeFittedOnce = false; // Reset to allow refitting on next route
+                    console.log("[WEBVIEW] CLEAR_ROUTE: removed route corridor");
+                  }
+                  
+                  // Clear route stop highlight (legacy)
                   if (window.__activeRouteStopId) {
                     if (window.__highlightedStopId && window.__busStopMarkers[window.__highlightedStopId]) {
                       const marker = window.__busStopMarkers[window.__highlightedStopId];
@@ -1639,6 +2140,36 @@ window.map.on("zoomend", function() {
                     console.log("[WEBVIEW] CLEAR_ROUTE: highlight cleared");
                   }
                   break;
+
+                case "STOP_PROGRESSION": {
+                  const { busId, nextStopIndex, currentStopIndex, etaMinutes } = data;
+                  console.log("[WEBVIEW] STOP_PROGRESSION:", busId, "next:", nextStopIndex);
+                  
+                  // Initialize next stop markers tracking
+                  if (!window.__nextStopMarkers) window.__nextStopMarkers = {};
+                  
+                  // Remove previous highlight for this bus
+                  const prevHighlight = window.__nextStopMarkers[busId];
+                  if (prevHighlight && window.__busStopMarkers[prevHighlight]) {
+                    const marker = window.__busStopMarkers[prevHighlight];
+                    marker.setIcon(createStopIcon(marker.__stopName || 'Stop'));
+                    console.log("[WEBVIEW] Removed previous highlight for", busId);
+                  }
+                  
+                  // Highlight new next stop
+                  if (nextStopIndex >= 0 && window.__busStops && window.__busStops[nextStopIndex]) {
+                    const stop = window.__busStops[nextStopIndex];
+                    const stopId = stop.id;
+                    
+                    if (window.__busStopMarkers[stopId]) {
+                      const marker = window.__busStopMarkers[stopId];
+                      marker.setIcon(createHighlightedStopIcon(marker.__stopName || 'Stop', etaMinutes));
+                      window.__nextStopMarkers[busId] = stopId;
+                      console.log("[WEBVIEW] Highlighted next stop:", stopId, "for bus:", busId);
+                    }
+                  }
+                  break;
+                }
 
                 case "FOCUS_STOP": {
                   const stop = data.stop;
@@ -1811,6 +2342,16 @@ window.map.on("zoomend", function() {
                     window.map.removeLayer(marker);
                     delete window.busMarkers[data.busId];
                     console.log("[WEBVIEW] Removed marker for offline bus:", data.busId);
+                  }
+                  // Clear next stop highlight for offline bus
+                  if (data.busId && window.__nextStopMarkers?.[data.busId]) {
+                    const prevStopId = window.__nextStopMarkers[data.busId];
+                    if (window.__busStopMarkers[prevStopId]) {
+                      const marker = window.__busStopMarkers[prevStopId];
+                      marker.setIcon(createStopIcon(marker.__stopName || 'Stop'));
+                      console.log("[WEBVIEW] Removed next stop highlight for offline bus:", data.busId);
+                    }
+                    delete window.__nextStopMarkers[data.busId];
                   }
                   // Clear follow ONLY if this bus was being followed
                   if (window.__followBusId === data.busId) {

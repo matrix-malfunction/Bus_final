@@ -1,6 +1,6 @@
 import React, { useCallback, useState, useRef, useEffect } from "react";
 import { Button, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import { useFocusEffect } from "@react-navigation/native";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { activateKeepAwake, deactivateKeepAwake } from "expo-keep-awake";
 import * as Location from "expo-location";
 import * as TaskManager from "expo-task-manager";
@@ -259,7 +259,23 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
   }
 });
 
-export default function DriverTrackingScreen({ token }) {
+export default function DriverTrackingScreen({ 
+  token, 
+  routeId, 
+  routeName, 
+  routeColor, 
+  direction 
+}) {
+  const navigation = useNavigation();
+  
+  // Debug log to verify props received
+  console.log("[TRACKING SCREEN PARAMS]", {
+    routeId,
+    routeName,
+    routeColor,
+    direction,
+  });
+  
   const [busId, setBusId] = useState("BUS101");
   const [status, setStatus] = useState("Ready");
   const [isTracking, setIsTracking] = useState(false);
@@ -268,6 +284,7 @@ export default function DriverTrackingScreen({ token }) {
   const [failedQueue, setFailedQueue] = useState([]);
   const [isOnline, setIsOnline] = useState(true);
   const [queueCount, setQueueCount] = useState(0);
+  const [tripId, setTripId] = useState(null);
 
   // Refs for mutable state in callbacks
   const locationSubscriptionRef = useRef(null);
@@ -669,18 +686,30 @@ export default function DriverTrackingScreen({ token }) {
       const headers = { "Content-Type": "application/json" };
       if (token) headers["Authorization"] = `Bearer ${token}`;
       
+      const requestBody = { 
+        busId, 
+        lat: latitude, 
+        lng: longitude,
+        ...(routeId && { routeId }),
+        ...(routeName && { routeName }),
+        ...(routeColor && { routeColor }),
+        ...(direction && { direction })
+      };
+      
+      console.log("[START TRACKING PAYLOAD]", requestBody);
+      
       const response = await fetch(`${API_BASE_URL}/api/location/start`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ 
-          busId, 
-          lat: latitude, 
-          lng: longitude 
-        }),
+        body: JSON.stringify(requestBody),
       });
       
       if (response.ok) {
-        console.log("[BACKEND] Start tracking API success");
+        const data = await response.json();
+        console.log("[BACKEND] Start tracking API success:", data);
+        if (data.tripId) {
+          setTripId(data.tripId);
+        }
       } else {
         console.log("[BACKEND] Start tracking API failed:", response.status);
       }
@@ -709,6 +738,14 @@ export default function DriverTrackingScreen({ token }) {
     } catch (err) {
       console.log("[BACKEND] Stop tracking API error:", err.message);
     }
+  };
+  
+  // End shift and return to route selection
+  const handleEndShift = async () => {
+    if (isTracking) {
+      await stopTracking();
+    }
+    navigation.replace("RouteSelection", { token });
   };
 
   // Start tracking with watchPositionAsync
@@ -1160,6 +1197,20 @@ export default function DriverTrackingScreen({ token }) {
   return (
     <View style={styles.container}>
       <Text style={styles.heading}>Driver Live Tracking</Text>
+      
+      {/* Route Info Card */}
+      {routeName && (
+        <View style={styles.routeCard}>
+          <View style={[styles.routeColorBar, { backgroundColor: routeColor || "#64748b" }]} />
+          <View style={styles.routeInfo}>
+            <Text style={styles.routeName}>{routeName}</Text>
+            <Text style={styles.routeMeta}>
+              {direction} • {tripId ? `Trip: ${tripId.slice(-6)}` : "Starting..."}
+            </Text>
+          </View>
+        </View>
+      )}
+      
       <TextInput style={styles.input} value={busId} onChangeText={setBusId} placeholder="Bus ID" />
       <View style={styles.row}>
         <Pressable style={styles.startButton} onPress={startTracking}>
@@ -1172,6 +1223,12 @@ export default function DriverTrackingScreen({ token }) {
       <Pressable style={styles.emergencyButton} onPress={sendEmergency}>
         <Text style={styles.emergencyText}>[SOS] BUS BREAKDOWN</Text>
       </Pressable>
+      
+      {/* End Shift Button */}
+      <Pressable style={styles.endShiftButton} onPress={handleEndShift}>
+        <Text style={styles.endShiftText}>END SHIFT</Text>
+      </Pressable>
+      
       <Text style={styles.note}>Tracking: {isTracking ? (isOnline ? "● Online" : "● Offline") : "Paused"}</Text>
       <Text style={styles.note}>Location: {currentLocation ? `${currentLocation.latitude.toFixed(4)}, ${currentLocation.longitude.toFixed(4)}` : "No GPS yet"}</Text>
       {queueCount > 0 && (
@@ -1227,6 +1284,43 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   emergencyText: {
+    color: "#fff",
+    fontWeight: "700",
+  },
+  routeCard: {
+    flexDirection: "row",
+    backgroundColor: "#f8fafc",
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  routeColorBar: {
+    width: 4,
+    borderRadius: 2,
+    marginRight: 12,
+  },
+  routeInfo: {
+    flex: 1,
+  },
+  routeName: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#1e293b",
+  },
+  routeMeta: {
+    fontSize: 12,
+    color: "#64748b",
+    marginTop: 2,
+  },
+  endShiftButton: {
+    backgroundColor: "#64748b",
+    borderRadius: 8,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  endShiftText: {
     color: "#fff",
     fontWeight: "700",
   },
