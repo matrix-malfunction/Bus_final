@@ -1550,7 +1550,23 @@ const HomeScreen = () => {
             <Text style={styles.nearbyStopDetails}>No nearby stops found</Text>
           ) : (
             nearestStops.map((stop, index) => (
-              <TouchableOpacity key={stop.id || index} style={styles.nearbyStopCard}>
+              <TouchableOpacity
+                key={stop.id || index}
+                style={styles.nearbyStopCard}
+                activeOpacity={0.7}
+                onPress={() => {
+                  console.log("[RN] Nearest stop pressed:", stop.name);
+                  navigation.navigate("FullMap", {
+                    focusStop: {
+                      id: stop.id,
+                      name: stop.name,
+                      latitude: stop.lat,
+                      longitude: stop.lng,
+                    },
+                    userLocation: userLocation,
+                  });
+                }}
+              >
                 <View style={styles.nearbyStopInfo}>
                   <Text style={styles.nearbyStopName}>{stop.name}</Text>
                   <Text style={styles.nearbyStopDetails}>

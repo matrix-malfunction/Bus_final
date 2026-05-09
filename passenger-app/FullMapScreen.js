@@ -25,7 +25,7 @@ export default function FullMapScreen({ route }) {
   // Default center (Chennai) - prevents crash when no route params
   const DEFAULT_CENTER = { latitude: 13.0827, longitude: 80.2707 };
   const { buses: contextBuses, socket, followBusId, setFollowBusId, setUserLocation, busStops } = useBus();
-  const { buses: routeBuses, userLocation: routeUserLocation, center: routeCenter } = route?.params || {};
+  const { buses: routeBuses, userLocation: routeUserLocation, center: routeCenter, focusStop, userLocation: navUserLocation } = route?.params || {};
 
   // Convert context buses (object) to array and merge with route buses
   // MUST be defined before any hooks that reference it
@@ -241,6 +241,21 @@ export default function FullMapScreen({ route }) {
       })
     );
   }, [followBusId, webViewReady]);
+
+  // Send FOCUS_STOP to WebView when navigating from nearest stops
+  useEffect(() => {
+    if (!focusStop || !webViewRef.current) return;
+
+    console.log("[RN FullMap] Focusing stop:", focusStop.name);
+
+    webViewRef.current.postMessage(
+      JSON.stringify({
+        type: "FOCUS_STOP",
+        stop: focusStop,
+        userLocation: navUserLocation,
+      })
+    );
+  }, [focusStop, navUserLocation]);
 
   // Send toggle state to WebView when it changes
   useEffect(() => {
@@ -1097,6 +1112,60 @@ function removeHighlight() {
   }
 }
 
+// Draw route from user location to stop using OSRM
+async function drawRouteToStop(userLat, userLng, stopLat, stopLng) {
+  console.log("[WEBVIEW] drawRouteToStop:", userLat, userLng, "→", stopLat, stopLng);
+  
+  // Remove previous route if exists
+  if (window.__focusRouteLayer) {
+    window.map.removeLayer(window.__focusRouteLayer);
+    window.__focusRouteLayer = null;
+  }
+  
+  try {
+    // Fetch OSRM route (using string concatenation to avoid nested template literal issues)
+    const url =
+      "https://router.project-osrm.org/route/v1/foot/" +
+      userLng +
+      "," +
+      userLat +
+      ";" +
+      stopLng +
+      "," +
+      stopLat +
+      "?overview=full&geometries=geojson";
+    const response = await fetch(url);
+    const data = await response.json();
+    
+    if (!data.routes || !data.routes[0]) {
+      console.log("[WEBVIEW] No route found");
+      return null;
+    }
+    
+    const route = data.routes[0];
+    const coords = route.geometry.coordinates.map(c => [c[1], c[0]]); // [lat, lng]
+    
+    // Draw polyline
+    window.__focusRouteLayer = L.polyline(coords, {
+      color: '#007AFF',
+      weight: 5,
+      opacity: 0.9,
+      dashArray: '10, 10'
+    }).addTo(window.map);
+    
+    // Calculate distance and ETA
+    const distanceKm = (route.distance / 1000).toFixed(1);
+    const etaMin = Math.ceil(route.duration / 60);
+    
+    console.log("[WEBVIEW] Route drawn:", distanceKm + "km,", etaMin + "min");
+    
+    return { distanceKm, etaMin };
+  } catch (err) {
+    console.error("[WEBVIEW] drawRouteToStop error:", err.message);
+    return null;
+  }
+}
+
 // Highlight nearest stop to user
 function highlightNearestStop(userLat, userLng, shouldHighlight) {
   console.log("[WEBVIEW] highlightNearestStop called:", userLat, userLng, "shouldHighlight:", shouldHighlight, "markers:", Object.keys(window.__busStopMarkers || {}).length, "stops:", window.__busStops?.length);
@@ -1456,8 +1525,8 @@ window.map.on("zoomend", function() {
               console.log("[WEBVIEW] SOS_ACK sent for", busId);
             }
 
-            // 9) MESSAGE HANDLER
-            function handleMessage(event) {
+            // 9) MESSAGE HANDLER (async to support await in handlers)
+            async function handleMessage(event) {
               let data;
               try {
                 data = JSON.parse(event.data || "{}");
@@ -1570,6 +1639,58 @@ window.map.on("zoomend", function() {
                     console.log("[WEBVIEW] CLEAR_ROUTE: highlight cleared");
                   }
                   break;
+
+                case "FOCUS_STOP": {
+                  const stop = data.stop;
+                  const userLocation = data.userLocation;
+                  console.log("[WebView] FOCUS_STOP:", stop?.name);
+
+                  if (!stop || !window.map) return;
+
+                  const lat = Number(stop.latitude);
+                  const lng = Number(stop.longitude);
+
+                  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+                  // Fly to stop location
+                  window.map.flyTo([lat, lng], 18, {
+                    duration: 1.2,
+                  });
+
+                  // Draw route and update popup if user location available
+                  if (userLocation && userLocation.latitude && userLocation.longitude) {
+                    const userLat = Number(userLocation.latitude);
+                    const userLng = Number(userLocation.longitude);
+                    
+                    if (Number.isFinite(userLat) && Number.isFinite(userLng)) {
+                      drawRouteToStop(userLat, userLng, lat, lng).then(function(result) {
+                        if (result && window.__busStopMarkers[stop.id]) {
+                          const marker = window.__busStopMarkers[stop.id];
+                          const stopName = marker.__stopName || stop.name || 'Bus Stop';
+                          
+                          // Update popup content with distance and ETA
+                          const popupContent = 
+                            '<div style="font-size:14px;">' +
+                              '<strong>' + stopName + '</strong><br/>' +
+                              '<span style="color:#007AFF;">📍 ' + result.distanceKm + ' km away</span><br/>' +
+                              '<span style="color:#16a34a;">🚶 ' + result.etaMin + ' min walk</span>' +
+                            '</div>';
+                          
+                          marker.setPopupContent(popupContent);
+                          marker.openPopup();
+                          console.log("[WEBVIEW] FOCUS_STOP: route drawn, popup updated");
+                        }
+                      });
+                    }
+                  } else {
+                    // Just open popup without route if no user location
+                    if (window.__busStopMarkers[stop.id]) {
+                      window.__busStopMarkers[stop.id].openPopup();
+                    }
+                  }
+
+                  break;
+                }
 
                 case "TOGGLE_NEAREST_ROUTE":
                   window.__showNearestRoute = data.enabled;
