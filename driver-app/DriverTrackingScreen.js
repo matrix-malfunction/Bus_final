@@ -104,7 +104,14 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
       console.log("[BG TASK] BLOCKED - tracking not active");
       return;
     }
-    
+
+    // DOUBLE-CHECK: Validate from AsyncStorage to prevent zombie updates
+    const trackingActive = await AsyncStorage.getItem("trackingActive");
+    if (trackingActive !== "true") {
+      console.log("[BG TASK] BLOCKED - AsyncStorage trackingActive is not true");
+      return;
+    }
+
     // Validate data before access
     if (!data || !data.locations || !Array.isArray(data.locations) || data.locations.length === 0) {
       console.log("[BG TASK] No valid locations data");
@@ -305,6 +312,7 @@ export default function DriverTrackingScreen({
   const flushInProgressRef = useRef(false);
   const guaranteeTimeoutRef = useRef(null);
   const trackingStartInFlightRef = useRef(false); // Prevent duplicate tracking starts
+  const trackingLifecycleRef = useRef("idle"); // idle | starting | active | stopping
 
   // Calculate distance between two coordinates (Haversine formula)
   const calculateDistance = (lat1, lng1, lat2, lng2) => {
@@ -761,22 +769,22 @@ export default function DriverTrackingScreen({
 
   // Start tracking with watchPositionAsync
   const startTracking = async () => {
-    // Fix #1: Prevent duplicate tracking starts
-    if (trackingStartInFlightRef.current) {
-      console.log("[TRACKING] Start blocked - already starting");
+    // LIFECYCLE STATE MACHINE: Block if not idle
+    const currentState = trackingLifecycleRef.current;
+    if (currentState !== "idle") {
+      console.log(`[TRACKING] Start blocked - lifecycle is ${currentState}`);
       return;
     }
-    trackingStartInFlightRef.current = true;
 
-    if (locationSubscriptionRef.current) {
-      console.log("[TRACKING] Already running");
-      trackingStartInFlightRef.current = false;
-      return;
-    }
+    // Set lifecycle to starting
+    trackingLifecycleRef.current = "starting";
+    console.log("[TRACKING] Lifecycle: idle → starting");
 
     const { status } = await Location.requestForegroundPermissionsAsync();
     if (status !== "granted") {
       setStatus("Location permission required");
+      trackingLifecycleRef.current = "idle";
+      console.log("[TRACKING] Lifecycle: starting → idle (permission denied)");
       return;
     }
 
@@ -787,10 +795,10 @@ export default function DriverTrackingScreen({
       });
       const { latitude, longitude } = currentLoc.coords;
       setCurrentLocation({ latitude, longitude });
-      
+
       // Call backend to start tracking (emits BUS_LOCATION_UPDATE immediately)
       await callBackendStartTracking(latitude, longitude);
-      
+
       // BATTERY OPTIMIZED: Use watchPositionAsync for efficient GPS
       const subscription = await Location.watchPositionAsync(
         {
@@ -812,6 +820,11 @@ export default function DriverTrackingScreen({
       locationSubscriptionRef.current = subscription;
       setIsTracking(true);
       global.__trackingActive = true;
+
+      // Transition to active state
+      trackingLifecycleRef.current = "active";
+      console.log("[TRACKING] Lifecycle: starting → active");
+
       setStatus("Tracking active (optimized)");
       console.log("[TRACKING] watchPositionAsync started");
 
@@ -826,10 +839,10 @@ export default function DriverTrackingScreen({
           const loc = await Location.getCurrentPositionAsync({
             accuracy: Location.Accuracy.High
           });
-          
+
           await fetch(`${API_BASE_URL}/api/location/update`, {
             method: "POST",
-            headers: { 
+            headers: {
               "Content-Type": "application/json",
               ...(token && { "Authorization": `Bearer ${token}` })
             },
@@ -854,14 +867,25 @@ export default function DriverTrackingScreen({
     } catch (err) {
       console.log("[TRACKING] Start error:", err.message);
       setStatus("GPS error: " + err.message);
-    } finally {
-      // Fix #1: Reset in-flight flag
-      trackingStartInFlightRef.current = false;
+      // Reset to idle on failure
+      trackingLifecycleRef.current = "idle";
+      console.log("[TRACKING] Lifecycle: starting → idle (error)");
     }
   };
 
   // Stop tracking and cleanup
   const stopTracking = async () => {
+    // LIFECYCLE STATE MACHINE: Block if idle or already stopping
+    const currentState = trackingLifecycleRef.current;
+    if (currentState === "idle" || currentState === "stopping") {
+      console.log(`[TRACKING] Stop blocked - lifecycle is ${currentState}`);
+      return;
+    }
+
+    // Set lifecycle to stopping
+    trackingLifecycleRef.current = "stopping";
+    console.log("[TRACKING] Lifecycle: active → stopping");
+
     if (locationSubscriptionRef.current) {
       locationSubscriptionRef.current.remove();
       locationSubscriptionRef.current = null;
@@ -870,15 +894,16 @@ export default function DriverTrackingScreen({
 
     // Stop background tracking
     await stopBackgroundTracking();
-    
+
     // Call backend to stop tracking (emits BUS_OFFLINE)
+    let backendSuccess = false;
     try {
       const stopBody = {
         busId,
         trackingActive: false,
         timestamp: new Date().toISOString(),
       };
-      const headers = { 
+      const headers = {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${token}`
       };
@@ -888,10 +913,11 @@ export default function DriverTrackingScreen({
         body: JSON.stringify(stopBody),
       });
       console.log("[STOP] Sent trackingActive: false to backend");
+      backendSuccess = true;
     } catch (err) {
       console.log("[STOP] Failed to notify backend:", err.message);
     }
-    
+
     // CLEAR QUEUE: Prevent queued updates from reviving bus after STOP
     setFailedQueue([]);
     saveQueueToStorage([]);
@@ -902,7 +928,7 @@ export default function DriverTrackingScreen({
       clearTimeout(pendingRetryRef.current);
       pendingRetryRef.current = null;
     }
-    
+
     // Clear guarantee timeout
     if (guaranteeTimeoutRef.current) {
       clearTimeout(guaranteeTimeoutRef.current);
@@ -913,6 +939,37 @@ export default function DriverTrackingScreen({
     setIsTracking(false);
     global.__trackingActive = false;
     setStatus("Tracking stopped");
+
+    // TEARDOWN: Clear all persisted tracking keys
+    try {
+      await AsyncStorage.multiRemove([
+        BUS_ID_KEY,
+        TOKEN_KEY,
+        LAST_LOCATION_KEY,
+        LAST_SENT_KEY,
+        QUEUE_STORAGE_KEY,
+        "trackingActive",
+        "currentTrip",
+        "trackingSession",
+        "activeTrip",
+        "selectedRoute",
+      ]);
+      console.log("[STOP] All persisted keys cleared");
+    } catch (clearErr) {
+      console.log("[STOP] Clear keys error:", clearErr.message);
+    }
+
+    // TEARDOWN: Reset globals
+    global.bgBusId = null;
+    global.bgToken = null;
+    global.bgLastLocation = null;
+    global.bgLastSentTimestamp = null;
+    global.__trackingActive = false;
+    console.log("[STOP] Global state reset");
+
+    // LIFECYCLE: Transition to idle after complete teardown
+    trackingLifecycleRef.current = "idle";
+    console.log("[TRACKING] Lifecycle: stopping → idle");
   };
 
   // Cleanup on unmount - PRODUCTION SAFE
@@ -961,6 +1018,17 @@ export default function DriverTrackingScreen({
   useEffect(() => {
     const restoreGlobalsAndCheckTracking = async () => {
       try {
+        // VALIDATE: Only restore if tracking was actually active
+        const trackingActive = await AsyncStorage.getItem("trackingActive");
+        if (trackingActive !== "true") {
+          console.log("[APP START] Skip restore - tracking not active");
+          // Clear any orphaned globals
+          global.bgBusId = null;
+          global.bgToken = null;
+          global.__trackingActive = false;
+          return;
+        }
+
         // Restore busId and token from AsyncStorage to globals
         const storedBusId = await AsyncStorage.getItem(BUS_ID_KEY);
         const storedToken = await AsyncStorage.getItem(TOKEN_KEY);

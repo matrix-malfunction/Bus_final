@@ -116,9 +116,13 @@ export function BusProvider({ children }) {
           direction: data.direction || null,
           tripId: data.tripId || null,
           // Progression data from backend
+          currentStopId: data.currentStopId || null,
           currentStopName: data.currentStopName || null,
+          nextStopId: data.nextStopId || null,
           nextStopName: data.nextStopName || null,
+          passedStopIds: data.passedStopIds || [],
           nextStopEtaMinutes: data.nextStopEtaMinutes ?? null,
+          remainingDistanceMeters: data.remainingDistanceMeters ?? null,
           routeProgressIndex: data.routeProgressIndex ?? null,
         };
         const newBuses = { ...prevBuses };

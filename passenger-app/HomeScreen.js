@@ -264,7 +264,62 @@ document.addEventListener("DOMContentLoaded", function() {
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
       return R * c; // Distance in meters
     }
-    
+
+    // Update ETA badge on bus marker (lightweight progression display)
+    function updateBusEtaBadge(marker, etaMinutes) {
+      if (!marker) return;
+
+      // Remove existing badge
+      if (marker.__etaBadge) {
+        marker.removeLayer(marker.__etaBadge);
+        marker.__etaBadge = null;
+      }
+
+      // Skip if no valid ETA
+      if (etaMinutes === null || etaMinutes === undefined || etaMinutes < 0) {
+        return;
+      }
+
+      // Create ETA badge as a divIcon attached to marker
+      const etaIcon = L.divIcon({
+        className: 'bus-eta-badge',
+        html: '<div style="' +
+          'background:#2563eb;' +
+          'color:white;' +
+          'padding:2px 6px;' +
+          'border-radius:10px;' +
+          'font-size:10px;' +
+          'font-weight:600;' +
+          'white-space:nowrap;' +
+          'box-shadow:0 1px 3px rgba(0,0,0,0.3);' +
+          'position:absolute;' +
+          'top:-20px;' +
+          'left:50%;' +
+          'transform:translateX(-50%);' +
+          'z-index:1000;' +
+          '">' + etaMinutes + ' min</div>',
+        iconSize: [60, 20],
+        iconAnchor: [30, 0]
+      });
+
+      // Create badge marker and bind to bus position
+      const badgeMarker = L.marker(marker.getLatLng(), {
+        icon: etaIcon,
+        interactive: false,
+        zIndexOffset: 1000
+      }).addTo(window.map);
+
+      // Store reference for updates
+      marker.__etaBadge = badgeMarker;
+
+      // Sync badge position with bus marker
+      marker.on('move', function() {
+        if (marker.__etaBadge) {
+          marker.__etaBadge.setLatLng(marker.getLatLng());
+        }
+      });
+    }
+
     // Compute nearest 3 stops
     function computeNearestStops(userLat, userLng) {
       if (!window.__busStopMarkers || Object.keys(window.__busStopMarkers).length === 0) {
@@ -575,24 +630,44 @@ document.addEventListener("DOMContentLoaded", function() {
                 send("BUS_UPDATE: skip invalid bus");
                 return;
               }
-              
+
+              // Skip inactive buses (ghost protection)
+              if (bus.trackingActive !== true) {
+                send("BUS_UPDATE: skip inactive bus " + bus.busId);
+                return;
+              }
+
               const busId = bus.busId;
               const busPos = [bus.lat, bus.lng];
-              
+              const etaMinutes = bus.nextStopEtaMinutes || bus.etaMinutes || null;
+
               if (window.busMarkers[busId]) {
                 // Update existing marker position
                 window.busMarkers[busId].setLatLng(busPos);
-                send("BUS_UPDATE: " + busId + " moved");
+                // Update ETA badge if progression changed
+                const prevEta = window.busMarkers[busId].__etaMinutes;
+                if (etaMinutes !== prevEta) {
+                  window.busMarkers[busId].__etaMinutes = etaMinutes;
+                  updateBusEtaBadge(window.busMarkers[busId], etaMinutes);
+                }
+                send("BUS_UPDATE: " + busId + " moved, ETA: " + (etaMinutes || 'N/A'));
               } else {
                 // Create new marker (view-only, no popup, no interaction)
-                const marker = L.marker(busPos, { 
+                const marker = L.marker(busPos, {
                   icon: window.busIcon,
                   interactive: false,
                   zIndexOffset: 500
                 }).addTo(window.map);
-                
+
+                // Store ETA for badge updates
+                marker.__etaMinutes = etaMinutes;
+                marker.__busId = busId;
+
+                // Add ETA badge
+                updateBusEtaBadge(marker, etaMinutes);
+
                 window.busMarkers[busId] = marker;
-                send("BUS_UPDATE: " + busId + " created");
+                send("BUS_UPDATE: " + busId + " created, ETA: " + (etaMinutes || 'N/A'));
               }
             });
             break;
@@ -603,12 +678,17 @@ document.addEventListener("DOMContentLoaded", function() {
               send("BUS_OFFLINE: no marker to remove");
               return;
             }
-            
+
             const busId = data.busId;
             if (window.busMarkers[busId]) {
+              // Clean up ETA badge first
+              if (window.busMarkers[busId].__etaBadge) {
+                window.map.removeLayer(window.busMarkers[busId].__etaBadge);
+              }
               window.map.removeLayer(window.busMarkers[busId]);
               delete window.busMarkers[busId];
-              send("BUS_OFFLINE: " + busId + " removed");
+              const remaining = Object.keys(window.busMarkers).length;
+              send("BUS_OFFLINE: " + busId + " removed, remaining: " + remaining);
             } else {
               send("BUS_OFFLINE: " + busId + " not found");
             }
@@ -1168,9 +1248,10 @@ const HomeScreen = () => {
       bus &&
       bus.busId &&
       bus.lat &&
-      bus.lng
+      bus.lng &&
+      bus.trackingActive === true
     );
-    
+
     console.log("[RN] Active buses for MiniMap:", activeBuses.length);
 
     // ORDER-INDEPENDENT + NOISE-REDUCED SIGNATURE
@@ -1220,8 +1301,15 @@ const HomeScreen = () => {
         bus &&
         bus.busId &&
         bus.lat &&
-        bus.lng
+        bus.lng &&
+        bus.trackingActive === true
       );
+
+      // Return early if no active buses
+      if (latestActiveBuses.length === 0) {
+        console.log("[RN] Retry skipped - no active buses");
+        return;
+      }
 
       const latestPayload = JSON.stringify({
         type: "BUS_UPDATE",
@@ -1557,7 +1645,7 @@ const HomeScreen = () => {
                 onPress={() => {
                   console.log("[RN] Nearest stop pressed:", stop.name);
                   navigation.navigate("FullMap", {
-                    focusStop: {
+                    highlightedStop: {
                       id: stop.id,
                       name: stop.name,
                       latitude: stop.lat,

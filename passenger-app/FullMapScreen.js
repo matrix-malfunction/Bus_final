@@ -20,13 +20,14 @@ export default function FullMapScreen({ route }) {
   const lastUserLocationRef = useRef(null); // Cache for resend on WebView load
   const busStopsRef = useRef(null); // Cache bus stops for resend
   const lastDrawnRouteRef = useRef(null); // Track last drawn route to prevent redraw spam
+  const lastFittedRouteRef = useRef(null); // Track last fitted route to prevent camera spam
   const [webViewReady, setWebViewReady] = useState(false);
   const [showNearestRoute, setShowNearestRoute] = useState(false);
 
   // Default center (Chennai) - prevents crash when no route params
   const DEFAULT_CENTER = { latitude: 13.0827, longitude: 80.2707 };
   const { buses: contextBuses, socket, followBusId, setFollowBusId, setUserLocation, busStops, busProgress } = useBus();
-  const { buses: routeBuses, userLocation: routeUserLocation, center: routeCenter, focusStop, userLocation: navUserLocation } = route?.params || {};
+  const { buses: routeBuses, userLocation: routeUserLocation, center: routeCenter, focusStop, userLocation: navUserLocation, highlightedStop } = route?.params || {};
 
   // Convert context buses (object) to array and merge with route buses
   // MUST be defined before any hooks that reference it
@@ -331,11 +332,65 @@ export default function FullMapScreen({ route }) {
     lastDrawnRouteRef.current = routeKey;
     console.log("[Route Corridor] Drew route:", routeKey, "with", routeCoords.length, "points");
     
+    // FIT_ROUTE: Auto-frame route corridor once (skip in follow mode)
+    const fitKey = `${activeBusId}_${activeRouteId}`;
+    if (!followBusId && lastFittedRouteRef.current !== fitKey) {
+      console.log("[Route Corridor] Fitting route bounds:", fitKey);
+      webViewRef.current.postMessage(JSON.stringify({
+        type: "FIT_ROUTE",
+        coordinates: routeCoords
+      }));
+      lastFittedRouteRef.current = fitKey;
+    } else if (followBusId) {
+      console.log("[Route Corridor] Skip fit - follow mode active for:", followBusId);
+    } else {
+      console.log("[Route Corridor] Skip fit - already fitted:", fitKey);
+    }
+    
     // Cleanup: clear route when effect re-runs with different bus/route
     return () => {
       // Route will be cleared by next effect run or component unmount
     };
   }, [followBusId, selectedBusId, buses]); // Dependencies: only bus selection/follow changes
+
+  // Send STOP_PROGRESS_UPDATE to WebView when bus stop progression changes
+  // Backend-driven route stop visualization (passed, current, next)
+  useEffect(() => {
+    if (!webViewRef.current || !webViewReady) return;
+    if (!buses || buses.length === 0) return;
+    
+    // Find buses with progression data
+    buses.forEach(bus => {
+      if (bus.currentStopId || bus.nextStopId || (bus.passedStopIds && bus.passedStopIds.length > 0)) {
+        // Create hash to prevent spam
+        const progressHash = `${bus.busId}:${bus.currentStopId}:${bus.nextStopId}:${(bus.passedStopIds || []).join(',')}`;
+        const lastHash = window.__lastProgressHash?.[bus.busId];
+        
+        if (lastHash === progressHash) return;
+        
+        // Store hash globally
+        if (!window.__lastProgressHash) window.__lastProgressHash = {};
+        window.__lastProgressHash[bus.busId] = progressHash;
+        
+        console.log("[RN FullMap] Sending STOP_PROGRESS_UPDATE:", bus.busId, {
+          passed: bus.passedStopIds?.length || 0,
+          current: bus.currentStopId,
+          next: bus.nextStopId
+        });
+        
+        webViewRef.current.postMessage(
+          JSON.stringify({
+            type: "STOP_PROGRESS_UPDATE",
+            busId: bus.busId,
+            passedStopIds: bus.passedStopIds || [],
+            currentStopId: bus.currentStopId,
+            nextStopId: bus.nextStopId,
+            routeProgressIndex: bus.routeProgressIndex
+          })
+        );
+      }
+    });
+  }, [buses, webViewReady]);
 
   // Send FOCUS_STOP to WebView when navigating from nearest stops
   useEffect(() => {
@@ -351,6 +406,20 @@ export default function FullMapScreen({ route }) {
       })
     );
   }, [focusStop, navUserLocation]);
+
+  // Send HIGHLIGHT_STOP to WebView when navigating from HomeScreen nearest stops
+  useEffect(() => {
+    if (!highlightedStop || !webViewRef.current) return;
+
+    console.log("[RN FullMap] Highlighting stop:", highlightedStop.name);
+
+    webViewRef.current.postMessage(
+      JSON.stringify({
+        type: "HIGHLIGHT_STOP",
+        stop: highlightedStop
+      })
+    );
+  }, [highlightedStop]);
 
   // Send toggle state to WebView when it changes
   useEffect(() => {
@@ -368,12 +437,15 @@ export default function FullMapScreen({ route }) {
 
     const handleBusOffline = (data) => {
       const busId = typeof data === 'string' ? data : data?.busId;
-      console.log("[FullMap RN] BUS_OFFLINE:", busId);
+      const reason = data?.reason || "unknown";
+      console.log("[FullMap RN] BUS_OFFLINE:", busId, "reason:", reason);
 
       if (webViewRef.current && webViewReady) {
         webViewRef.current.postMessage(JSON.stringify({
           type: "BUS_OFFLINE",
-          busId: busId
+          busId: busId,
+          reason: reason,
+          timestamp: data?.timestamp
         }));
       }
 
@@ -382,7 +454,13 @@ export default function FullMapScreen({ route }) {
         console.log("[FullMap RN] Clearing follow for offline bus:", busId);
         setFollowBusId(null);
       }
-      
+
+      // Clear selection ONLY if this bus was selected
+      if (selectedBusId === busId) {
+        console.log("[FullMap RN] Clearing selection for offline bus:", busId);
+        setSelectedBusId(null);
+      }
+
       // Clear route corridor if this was the active bus
       if ((followBusId === busId || selectedBusId === busId) && webViewRef.current && webViewReady) {
         console.log("[FullMap RN] Clearing route corridor for offline bus:", busId);
@@ -548,6 +626,30 @@ export default function FullMapScreen({ route }) {
             font-size: 12px;
             color: #666;
             margin: 4px 0;
+          }
+          .bus-popup-direction {
+            color: #666;
+            font-size: 11px;
+          }
+          .heading-arrow {
+            color: #999;
+            font-size: 11px;
+            margin-left: 4px;
+          }
+          .tracking-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: 500;
+          }
+          .tracking-badge-active {
+            background: #10B981;
+            color: white;
+          }
+          .tracking-badge-paused {
+            background: #999;
+            color: white;
           }
           .bus-popup-current-stop {
             color: #007AFF;
@@ -961,6 +1063,37 @@ export default function FullMapScreen({ route }) {
           .bus-marker--offline .bus-marker__body {
             background: #9ca3af !important;
           }
+          
+          /* LIVE/STALE freshness states */
+          .bus-marker--stale {
+            opacity: 0.6;
+            filter: grayscale(30%);
+          }
+          
+          .bus-marker--live {
+            opacity: 1;
+          }
+          
+          /* Freshness badges in popup */
+          .freshness-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 10px;
+            font-weight: 500;
+          }
+          .freshness-badge-live {
+            background: #10B981;
+            color: white;
+          }
+          .freshness-badge-stale {
+            background: #F59E0B;
+            color: white;
+  }
+          .freshness-badge-offline {
+    background: #EF4444;
+    color: white;
+  }
         </style>
       </head>
       <body>
@@ -1046,6 +1179,8 @@ export default function FullMapScreen({ route }) {
             window.userLocation = null;
             window.__pendingBusStopRender = false;
             window.__busAnimations = {}; // RAF animation tracking per bus
+            window.activeRouteLine = null; // Single active route polyline
+            window.highlightedStopMarker = null; // Single highlighted stop marker
 
             // 3) PRODUCTION-GRADE BUS MARKER ARCHITECTURE
             // Layered divIcon with DOM mutation-only updates
@@ -1235,6 +1370,37 @@ export default function FullMapScreen({ route }) {
               }
             }
             
+            // Calculate freshness state based on timestamp age
+            function calculateFreshnessState(timestamp) {
+              if (!timestamp) return 'live';
+              
+              const ageMs = Date.now() - new Date(timestamp).getTime();
+              
+              if (ageMs < 15000) { // < 15s
+                return 'live';
+              } else if (ageMs < 45000) { // 15s–45s
+                return 'stale';
+              } else { // > 45s
+                return 'offline';
+              }
+            }
+            
+            // Update freshness state (CSS classes)
+            function updateBusFreshness(marker, freshnessState) {
+              const els = getMarkerElements(marker);
+              if (!els || !els.container) return;
+              
+              // Remove previous freshness classes
+              els.container.classList.remove('bus-marker--live', 'bus-marker--stale');
+              
+              // Apply new freshness class (not for offline, BUS_OFFLINE handles that)
+              if (freshnessState === 'live') {
+                els.container.classList.add('bus-marker--live');
+              } else if (freshnessState === 'stale') {
+                els.container.classList.add('bus-marker--stale');
+              }
+            }
+            
             // Update SOS state (CSS class + ring visibility)
             function updateBusSOS(marker, isSOS) {
               const els = getMarkerElements(marker);
@@ -1369,9 +1535,39 @@ export default function FullMapScreen({ route }) {
                 : (bus.speed !== undefined ? Math.round(bus.speed * 3.6) : null);
               const speedKmh = displaySpeed;
               
-              // Tracking status
+              // Direction heading
+              const heading = bus.heading !== undefined ? Math.round(bus.heading) : null;
+              
+              // Last update age
+              const lastUpdate = bus.lastUpdate || bus.timestamp || Date.now();
+              const now = Date.now();
+              const ageSeconds = Math.floor((now - lastUpdate) / 1000);
+              let ageText = '';
+              if (ageSeconds < 60) {
+                ageText = ageSeconds + 's ago';
+              } else if (ageSeconds < 3600) {
+                ageText = Math.floor(ageSeconds / 60) + 'm ago';
+              } else {
+                ageText = Math.floor(ageSeconds / 3600) + 'h ago';
+              }
+              
+              // Tracking status with badge
               const isTracking = bus.trackingActive !== false;
               const trackingStatus = isTracking ? "Active" : "Paused";
+              const trackingBadge = isTracking 
+                ? '<span class="tracking-badge tracking-badge-active">● Active</span>'
+                : '<span class="tracking-badge tracking-badge-paused">○ Paused</span>';
+              
+              // Freshness badge based on timestamp age
+              const freshnessState = bus.__freshnessState || calculateFreshnessState(bus.timestamp || bus.lastUpdate);
+              let freshnessBadge = '';
+              if (freshnessState === 'live') {
+                freshnessBadge = '<span class="freshness-badge freshness-badge-live">● Live</span>';
+              } else if (freshnessState === 'stale') {
+                freshnessBadge = '<span class="freshness-badge freshness-badge-stale">● Stale</span>';
+              } else if (freshnessState === 'offline') {
+                freshnessBadge = '<span class="freshness-badge freshness-badge-offline">● Offline</span>';
+              }
               
               // Progression data (backend-driven) - support both direct and nested progression
               const prog = bus.progression || bus;
@@ -1397,32 +1593,55 @@ export default function FullMapScreen({ route }) {
               // Build metadata section
               let metaHtml = '';
               if (speedKmh !== null) {
-                metaHtml += '<div class="bus-popup-row">Speed: ' + speedKmh + ' km/h</div>';
+                metaHtml += '<div class="bus-popup-row">Speed: ' + speedKmh + ' km/h';
+                if (heading !== null) {
+                  metaHtml += ' <span class="heading-arrow">→ ' + heading + '°</span>';
+                }
+                metaHtml += '</div>';
               }
-              metaHtml += '<div class="bus-popup-row">Trip: ' + trackingStatus + '</div>';
+              metaHtml += '<div class="bus-popup-row">Updated: ' + ageText + '</div>';
+              metaHtml += '<div class="bus-popup-row">Signal: ' + freshnessBadge + '</div>';
+              metaHtml += '<div class="bus-popup-row">Tracking: ' + trackingBadge + '</div>';
               if (tripId) {
                 metaHtml += '<div class="bus-popup-row bus-popup-trip">ID: ' + tripId.slice(-6) + '</div>';
               }
               
               // Build live stop progression section (backend-driven)
+              // PROGRESSION GUARD: Skip if no valid progression data
+              const hasValidProgression = nextStopName || currentStopName || (remainingDistanceKm !== null && remainingDistanceKm > 0);
               let progressHtml = '';
-              if (currentStopName) {
-                progressHtml += '<div class="bus-popup-row bus-popup-current-stop"><strong>Current:</strong> ' + escapeText(currentStopName) + '</div>';
-              }
-              if (nextStopName) {
-                const etaText = nextStopEtaMinutes !== null ? ' (' + nextStopEtaMinutes + ' min)' : '';
-                progressHtml += '<div class="bus-popup-row bus-popup-next-stop"><strong>Next:</strong> ' + escapeText(nextStopName) + etaText + '</div>';
-              }
-              // Fallback to legacy progression display if stop names not available
-              if (!currentStopName && !nextStopName) {
+
+              if (hasValidProgression) {
+                // Primary: Next Stop with ETA (most important for passengers)
+                if (nextStopName) {
+                  const etaText = nextStopEtaMinutes !== null ? '<span class="stop-eta">' + nextStopEtaMinutes + ' min</span>' : '';
+                  const distanceText = remainingDistanceKm !== null ? '<span style="color:#666;font-size:11px;margin-left:8px;">' + remainingDistanceKm.toFixed(1) + ' km</span>' : '';
+                  progressHtml += '<div class="bus-popup-row bus-popup-next-stop" style="font-size:14px;margin:8px 0;">' +
+                    '<strong style="color:#2563eb;">→ Next:</strong> ' + escapeText(nextStopName) + etaText + distanceText + '</div>';
+                }
+
+                // Secondary: Current stop context
+                if (currentStopName) {
+                  progressHtml += '<div class="bus-popup-row bus-popup-current-stop" style="font-size:12px;color:#666;">' +
+                    '<strong>At:</strong> ' + escapeText(currentStopName) + '</div>';
+                }
+
+                // Progress percent as visual indicator
+                if (progressPercent !== null && progressPercent > 0) {
+                  progressHtml += '<div class="bus-popup-row" style="margin-top:6px;">' +
+                    '<div style="background:#e5e7eb;height:4px;border-radius:2px;overflow:hidden;">' +
+                    '<div style="background:#10b981;height:100%;width:' + progressPercent + '%;"></div>' +
+                    '</div>' +
+                    '<div style="text-align:center;font-size:10px;color:#666;margin-top:2px;">' + progressPercent + '% complete</div>' +
+                    '</div>';
+                }
+              } else {
+                // Fallback to legacy progression display if stop names not available
                 if (progressPercent !== null) {
                   progressHtml += '<div class="bus-popup-row">Progress: ' + progressPercent + '%</div>';
                 }
                 if (etaMinutes !== null) {
                   progressHtml += '<div class="bus-popup-row">ETA: ' + etaMinutes + ' min</div>';
-                }
-                if (currentStopIndex !== null && nextStopIndex !== null && nextStopIndex >= 0) {
-                  progressHtml += '<div class="bus-popup-row">Next Stop: #' + (nextStopIndex + 1) + '</div>';
                 }
                 if (remainingDistanceKm !== null) {
                   progressHtml += '<div class="bus-popup-row">Remaining: ' + remainingDistanceKm.toFixed(1) + ' km</div>';
@@ -1536,6 +1755,12 @@ export default function FullMapScreen({ route }) {
                 const bus = entry[1];
                 if (!bus?.lat || !bus?.lng) return;
 
+                // Ghost protection: skip inactive buses
+                if (bus.trackingActive !== true) {
+                  console.log("[WEBVIEW] Skip inactive bus:", id);
+                  return;
+                }
+
                 const latlng = [bus.lat, bus.lng];
 
                 // Calculate ETA if user location exists
@@ -1619,6 +1844,11 @@ export default function FullMapScreen({ route }) {
                     } else {
                       els.container.classList.add('bus-marker--stopped');
                     }
+                    
+                    // 8b. Apply freshness state (LIVE/STALE)
+                    const freshnessState = calculateFreshnessState(bus.timestamp || bus.lastUpdate);
+                    updateBusFreshness(marker, freshnessState);
+                    marker.__freshnessState = freshnessState; // Store for popup updates
                   }
 
                   // 9. Merge data for popup updates
@@ -2450,53 +2680,83 @@ window.map.on("zoomend", function() {
                   break;
 
                 case "DRAW_ROUTE":
-                  // Route corridor drawing (coordinates array)
+                  // Route corridor drawing with coordinate normalization
+                  console.log("[WEBVIEW] DRAW_ROUTE received for bus:", data.busId, "route:", data.routeId);
+                  
                   if (data.coordinates && Array.isArray(data.coordinates)) {
-                    // Skip if same route already active
-                    if (window.__activeRouteId === data.routeId && window.__activeRouteLine) {
-                      console.log("[WEBVIEW] DRAW_ROUTE: skip - same route active:", data.routeId);
-                      break;
-                    }
-                    
-                    // Check if this is a new route (for viewport fitting)
-                    const isNewRoute = window.__activeRouteId !== data.routeId;
-                    
-                    // Remove previous route line if exists
-                    if (window.__activeRouteLine) {
-                      window.map.removeLayer(window.__activeRouteLine);
-                      window.__activeRouteLine = null;
-                      window.__activeRouteId = null;
-                    }
-                    
-                    // Draw new route polyline
-                    const routeLine = L.polyline(data.coordinates, {
-                      color: data.routeColor || "#2563eb",
-                      weight: 5,
-                      opacity: 0.35,
-                    }).addTo(window.map);
-                    
-                    window.__activeRouteLine = routeLine;
-                    window.__activeRouteId = data.routeId;
-                    window.__activeBusId = data.busId; // Track which bus owns this route
-                    
-                    // One-time viewport fit: only fit on new route, not during GPS updates
-                    if (isNewRoute) {
-                      // Small delay to ensure polyline is fully rendered
-                      setTimeout(() => {
-                        if (window.__activeRouteLine && window.map) {
-                          window.map.fitBounds(
-                            routeLine.getBounds(),
-                            { padding: [40, 40], animate: true }
-                          );
-                          console.log("[WEBVIEW] DRAW_ROUTE: fitted viewport to route", data.routeId);
+                    try {
+                      // Remove previous route line if exists
+                      if (window.activeRouteLine) {
+                        window.map.removeLayer(window.activeRouteLine);
+                        window.activeRouteLine = null;
+                        console.log("[WEBVIEW] DRAW_ROUTE: removed previous polyline");
+                      }
+                      
+                      // Normalize coordinates: [lng,lat] → [lat,lng] for Leaflet
+                      const normalizedCoords = data.coordinates.map(coord => {
+                        if (Array.isArray(coord) && coord.length >= 2) {
+                          return [coord[1], coord[0]]; // Swap to [lat, lng]
+                        } else if (typeof coord === 'object' && coord !== null) {
+                          return [coord.lat, coord.lng];
                         }
-                      }, 100);
-                      window.__routeFittedOnce = true;
+                        return coord;
+                      });
+                      
+                      console.log("[WEBVIEW] DRAW_ROUTE: normalized", normalizedCoords.length, "coordinates");
+                      
+                      // Draw single L.polyline
+                      const routeLine = L.polyline(normalizedCoords, {
+                        color: data.routeColor || "#2563eb",
+                        weight: 5,
+                        opacity: 0.35,
+                      }).addTo(window.map);
+                      
+                      window.activeRouteLine = routeLine;
+                      
+                      console.log("[WEBVIEW] DRAW_ROUTE: success - drew route corridor", data.routeId, "with", normalizedCoords.length, "points");
+                    } catch (drawError) {
+                      console.error("[WEBVIEW] DRAW_ROUTE error:", drawError.message);
+                      // Safe fallback - ensure window.activeRouteLine is null on error
+                      window.activeRouteLine = null;
                     }
-                    
-                    console.log("[WEBVIEW] DRAW_ROUTE: drew route corridor", data.routeId, "with", data.coordinates.length, "points");
-                    break;
+                  } else {
+                    console.error("[WEBVIEW] DRAW_ROUTE: invalid coordinates");
                   }
+                  break;
+
+                case "FIT_ROUTE":
+                  // Auto-frame route corridor bounds
+                  console.log("[WEBVIEW] FIT_ROUTE received with", data.coordinates?.length, "coordinates");
+                  
+                  if (data.coordinates && Array.isArray(data.coordinates)) {
+                    try {
+                      // Normalize coordinates: [lng,lat] → [lat,lng] for Leaflet
+                      const normalizedCoords = data.coordinates.map(coord => {
+                        if (Array.isArray(coord) && coord.length >= 2) {
+                          return [coord[1], coord[0]]; // Swap to [lat, lng]
+                        } else if (typeof coord === 'object' && coord !== null) {
+                          return [coord.lat, coord.lng];
+                        }
+                        return coord;
+                      });
+                      
+                      // Build LatLng bounds from normalized coordinates
+                      const bounds = L.latLngBounds(normalizedCoords);
+                      
+                      // Fit map to route bounds with padding
+                      window.map.fitBounds(bounds, {
+                        padding: [40, 40],
+                        animate: true
+                      });
+                      
+                      console.log("[WEBVIEW] FIT_ROUTE: success - bounds fitted");
+                    } catch (fitError) {
+                      console.error("[WEBVIEW] FIT_ROUTE error:", fitError.message);
+                    }
+                  } else {
+                    console.error("[WEBVIEW] FIT_ROUTE: invalid coordinates");
+                  }
+                  break;
                   
                   // Store route stop ID for persistent highlighting (legacy)
                   if (data.stopId) {
@@ -2520,14 +2780,19 @@ window.map.on("zoomend", function() {
                   break;
 
                 case "CLEAR_ROUTE":
-                  // Remove route corridor polyline
-                  if (window.__activeRouteLine) {
-                    window.map.removeLayer(window.__activeRouteLine);
-                    window.__activeRouteLine = null;
-                    window.__activeRouteId = null;
-                    window.__activeBusId = null; // Clear bus ownership
-                    window.__routeFittedOnce = false; // Reset to allow refitting on next route
-                    console.log("[WEBVIEW] CLEAR_ROUTE: removed route corridor");
+                  // Remove route corridor polyline safely
+                  console.log("[WEBVIEW] CLEAR_ROUTE received");
+                  if (window.activeRouteLine) {
+                    try {
+                      window.map.removeLayer(window.activeRouteLine);
+                      window.activeRouteLine = null;
+                      console.log("[WEBVIEW] CLEAR_ROUTE: removed route corridor");
+                    } catch (clearError) {
+                      console.error("[WEBVIEW] CLEAR_ROUTE error:", clearError.message);
+                      window.activeRouteLine = null; // Ensure cleanup even on error
+                    }
+                  } else {
+                    console.log("[WEBVIEW] CLEAR_ROUTE: no active route to remove");
                   }
                   
                   // Clear route stop highlight (legacy)
@@ -2540,6 +2805,55 @@ window.map.on("zoomend", function() {
                     window.__highlightedStopId = null;
                     window.__activeRouteStopId = null;
                     console.log("[WEBVIEW] CLEAR_ROUTE: highlight cleared");
+                  }
+                  break;
+
+                case "HIGHLIGHT_STOP":
+                  // Highlight stop marker from HomeScreen navigation
+                  console.log("[WEBVIEW] HIGHLIGHT_STOP received:", data.stop?.name);
+                  
+                  if (data.stop && window.map) {
+                    try {
+                      // Remove previous highlighted marker if exists
+                      if (window.highlightedStopMarker) {
+                        window.map.removeLayer(window.highlightedStopMarker);
+                        window.highlightedStopMarker = null;
+                      }
+                      
+                      const stopLat = data.stop.latitude || data.stop.lat;
+                      const stopLng = data.stop.longitude || data.stop.lng;
+                      
+                      if (stopLat !== undefined && stopLng !== undefined) {
+                        // Draw highlighted circle marker
+                        const highlightedMarker = L.circleMarker([stopLat, stopLng], {
+                          radius: 15,
+                          fillColor: '#007AFF',
+                          color: '#0051D5',
+                          weight: 3,
+                          opacity: 1,
+                          fillOpacity: 0.3
+                        }).addTo(window.map);
+                        
+                        // Open popup with stop name
+                        highlightedMarker.bindPopup('<div style="text-align:center;font-weight:600;color:#333;">' + 
+                          escapeText(data.stop.name || 'Stop') + '</div>');
+                        highlightedMarker.openPopup();
+                        
+                        // Store marker reference
+                        window.highlightedStopMarker = highlightedMarker;
+                        
+                        // Fly to stop
+                        window.map.flyTo([stopLat, stopLng], 16, {
+                          animate: true,
+                          duration: 1
+                        });
+                        
+                        console.log("[WEBVIEW] HIGHLIGHT_STOP: success - marker drawn and flew to stop");
+                      }
+                    } catch (highlightError) {
+                      console.error("[WEBVIEW] HIGHLIGHT_STOP error:", highlightError.message);
+                      window.highlightedStopMarker = null; // Ensure cleanup on error
+                    }
                   }
                   break;
 
@@ -2683,6 +2997,63 @@ window.map.on("zoomend", function() {
                   break;
                 }
 
+                case "STOP_PROGRESS_UPDATE": {
+                  const { busId, passedStopIds, currentStopId, nextStopId, routeProgressIndex } = data;
+                  console.log("[WEBVIEW] STOP_PROGRESS_UPDATE:", busId, {
+                    passed: passedStopIds?.length || 0,
+                    current: currentStopId,
+                    next: nextStopId
+                  });
+                  
+                  // Update stop marker icons based on progression state
+                  if (window.__busStopMarkers) {
+                    // Update passed stops → gray
+                    if (passedStopIds && passedStopIds.length > 0) {
+                      passedStopIds.forEach(stopId => {
+                        const marker = window.__busStopMarkers[stopId];
+                        if (marker) {
+                          marker.setIcon(L.divIcon({
+                            className: 'bus-stop-marker',
+                            html: '<div style="width:24px;height:24px;background:#9CA3AF;border-radius:50%;border:3px solid white;box-shadow:0 2px 4px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;">✓</div>',
+                            iconSize: [24, 24],
+                            iconAnchor: [12, 12]
+                          }));
+                          marker.__stopStatus = 'passed';
+                        }
+                      });
+                    }
+                    
+                    // Update current stop → green pulse
+                    if (currentStopId) {
+                      const marker = window.__busStopMarkers[currentStopId];
+                      if (marker) {
+                        marker.setIcon(L.divIcon({
+                          className: 'bus-stop-marker current',
+                          html: '<div style="width:28px;height:28px;background:#22C55E;border-radius:50%;border:3px solid white;box-shadow:0 0 0 4px rgba(34,197,94,0.4),0 2px 4px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;animation:pulse 2s infinite;">●</div>',
+                          iconSize: [28, 28],
+                          iconAnchor: [14, 14]
+                        }));
+                        marker.__stopStatus = 'current';
+                      }
+                    }
+                    
+                    // Update next stop → orange
+                    if (nextStopId) {
+                      const marker = window.__busStopMarkers[nextStopId];
+                      if (marker) {
+                        marker.setIcon(L.divIcon({
+                          className: 'bus-stop-marker next',
+                          html: '<div style="width:24px;height:24px;background:#F97316;border-radius:50%;border:3px solid white;box-shadow:0 2px 4px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center;">➜</div>',
+                          iconSize: [24, 24],
+                          iconAnchor: [12, 12]
+                        }));
+                        marker.__stopStatus = 'next';
+                      }
+                    }
+                  }
+                  break;
+                }
+
                 case "TOGGLE_NEAREST_ROUTE":
                   window.__showNearestRoute = data.enabled;
                   console.log("[WEBVIEW] Toggle:", window.__showNearestRoute);
@@ -2807,13 +3178,18 @@ window.map.on("zoomend", function() {
                   }
 
                   // Clear route corridor if this was the active followed bus
-                  if (data.busId && window.__activeBusId === data.busId && window.__activeRouteLine) {
+                  if (window.activeRouteLine) {
+                    window.map.removeLayer(window.activeRouteLine);
+                    window.activeRouteLine = null;
+                    console.log("[WEBVIEW] Cleared route corridor for offline bus:", data.busId);
+                  }
+                  // Also clear legacy route variables if present
+                  if (window.__activeRouteLine) {
                     window.map.removeLayer(window.__activeRouteLine);
                     window.__activeRouteLine = null;
                     window.__activeRouteId = null;
                     window.__activeBusId = null;
                     window.__routeFittedOnce = false;
-                    console.log("[WEBVIEW] Cleared route corridor for offline bus:", data.busId);
                   }
 
                   // Apply offline transition before removal
