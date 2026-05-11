@@ -313,6 +313,7 @@ export default function DriverTrackingScreen({
   const guaranteeTimeoutRef = useRef(null);
   const trackingStartInFlightRef = useRef(false); // Prevent duplicate tracking starts
   const trackingLifecycleRef = useRef("idle"); // idle | starting | active | stopping
+  const firstUpdateAfterStartRef = useRef(false); // Allow first GPS update even with weak accuracy
 
   // Calculate distance between two coordinates (Haversine formula)
   const calculateDistance = (lat1, lng1, lat2, lng2) => {
@@ -501,9 +502,16 @@ export default function DriverTrackingScreen({
     const { latitude, longitude, accuracy, altitude, heading } = location;
     
     // GPS DRIFT FILTER: Skip low accuracy locations (>50m)
-    if (accuracy && accuracy > 50) {
+    // EXCEPTION: Allow first update after START even if accuracy is weak
+    if (accuracy && accuracy > 50 && !firstUpdateAfterStartRef.current) {
       console.log("[API] Skipped - low accuracy:", accuracy.toFixed(1), "m");
       return;
+    }
+
+    // First update allowed - clear flag
+    if (firstUpdateAfterStartRef.current) {
+      console.log("[API] First update after START - accuracy bypass:", accuracy?.toFixed(1), "m");
+      firstUpdateAfterStartRef.current = false;
     }
     
     // IGNORE GPS speed - compute using Haversine instead (more reliable when stationary)
@@ -636,6 +644,11 @@ export default function DriverTrackingScreen({
         setStatus("Retrying in " + (backoffDelay / 1000) + "s...");
 
         setTimeout(() => {
+          // GUARD: Retry may fire after STOP
+          if (!global.__trackingActive) {
+            console.log("[API] Retry cancelled - tracking stopped");
+            return;
+          }
           sendLocationToBackend(location, attempt + 1, isFromQueue);
         }, backoffDelay);
       } else {
@@ -819,6 +832,7 @@ export default function DriverTrackingScreen({
 
       locationSubscriptionRef.current = subscription;
       setIsTracking(true);
+      firstUpdateAfterStartRef.current = true;
       global.__trackingActive = true;
 
       // Transition to active state
@@ -886,6 +900,10 @@ export default function DriverTrackingScreen({
     trackingLifecycleRef.current = "stopping";
     console.log("[TRACKING] Lifecycle: active → stopping");
 
+    // HARD SHUTDOWN: Block all sends immediately BEFORE any async work
+    global.__trackingActive = false;
+    console.log("[STOP] trackingActiveRef = false (hard shutdown)");
+
     if (locationSubscriptionRef.current) {
       locationSubscriptionRef.current.remove();
       locationSubscriptionRef.current = null;
@@ -921,7 +939,8 @@ export default function DriverTrackingScreen({
     // CLEAR QUEUE: Prevent queued updates from reviving bus after STOP
     setFailedQueue([]);
     saveQueueToStorage([]);
-    console.log("[STOP] Queue cleared");
+    firstUpdateAfterStartRef.current = false;
+    console.log("[STOP] Queue cleared, firstUpdate flag reset");
 
     // Clear any pending retries
     if (pendingRetryRef.current) {
@@ -937,7 +956,6 @@ export default function DriverTrackingScreen({
     }
 
     setIsTracking(false);
-    global.__trackingActive = false;
     setStatus("Tracking stopped");
 
     // TEARDOWN: Clear all persisted tracking keys

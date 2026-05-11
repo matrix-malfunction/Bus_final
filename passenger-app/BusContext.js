@@ -33,7 +33,11 @@ export const BusContext = createContext({
   followBusId: null,
   setFollowBusId: () => {},
   busStops: STATIC_STOPS,
-  busProgress: {}
+  busProgress: {},
+  selectedStop: null,
+  setSelectedStop: () => {},
+  selectedStopRoute: null,
+  setSelectedStopRoute: () => {}
 });
 
 export const useBus = () => useContext(BusContext);
@@ -47,6 +51,8 @@ export function BusProvider({ children }) {
   const [userLocation, setUserLocation] = useState(null);
   const [busStops, setBusStops] = useState([]); // Will be populated from socket
   const [busProgress, setBusProgress] = useState({}); // Bus progression state
+  const [selectedStop, setSelectedStop] = useState(null); // Selected stop for navigation
+  const [selectedStopRoute, setSelectedStopRoute] = useState(null); // One-time stop route flow
 
   useEffect(() => {
     const newSocket = io(API_BASE_URL, {
@@ -206,7 +212,11 @@ export function BusProvider({ children }) {
     userLocation,
     setUserLocation,
     busStops, // Now from socket, not hardcoded
-    busProgress // Bus progression state from backend
+    busProgress, // Bus progression state from backend
+    selectedStop,
+    setSelectedStop,
+    selectedStopRoute,
+    setSelectedStopRoute
   };
 
   return <BusContext.Provider value={value}>{children}</BusContext.Provider>;
