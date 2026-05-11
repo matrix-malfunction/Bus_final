@@ -37,7 +37,8 @@ export const BusContext = createContext({
   selectedStop: null,
   setSelectedStop: () => {},
   selectedStopRoute: null,
-  setSelectedStopRoute: () => {}
+  setSelectedStopRoute: () => {},
+  stopArrivalsMap: {}
 });
 
 export const useBus = () => useContext(BusContext);
@@ -53,6 +54,7 @@ export function BusProvider({ children }) {
   const [busProgress, setBusProgress] = useState({}); // Bus progression state
   const [selectedStop, setSelectedStop] = useState(null); // Selected stop for navigation
   const [selectedStopRoute, setSelectedStopRoute] = useState(null); // One-time stop route flow
+  const [stopArrivalsMap, setStopArrivalsMap] = useState({}); // Realtime stop arrivals from backend
 
   useEffect(() => {
     const newSocket = io(API_BASE_URL, {
@@ -81,10 +83,16 @@ export function BusProvider({ children }) {
       console.log("[BusContext] Socket connection error:", error.message);
     });
 
+    // Listen for STOP_ARRIVALS_UPDATE from backend
+    newSocket.on("STOP_ARRIVALS_UPDATE", (payload) => {
+      console.log("[STOP ARRIVALS UPDATE]", Object.keys(payload.stopArrivals || {}).length);
+      setStopArrivalsMap(payload.stopArrivals || {});
+    });
+
     // Listen for BUS_LOCATION_UPDATE from backend
     newSocket.on("BUS_LOCATION_UPDATE", (data) => {
       console.log("[BusContext] BUS_LOCATION_UPDATE received:", data);
-      
+
       // Verify route metadata
       console.log("[PASSENGER ROUTE UPDATE]", {
         busId: data.busId,
@@ -93,6 +101,20 @@ export function BusProvider({ children }) {
         direction: data.direction,
         tripId: data.tripId,
       });
+
+      // Progression fields telemetry
+      console.log("[RN BUS]", {
+        busId: data.busId,
+        currentStopName: data.currentStopName,
+        nextStopName: data.nextStopName,
+        nextStopEtaMinutes: data.nextStopEtaMinutes
+      });
+
+      console.log("[RN SPEED]", {
+        busId: data.busId,
+        derivedSpeed: data.derivedSpeed,
+        speed: data.speed,
+      });
       
       if (!data || !data.busId) {
         console.log("[BusContext] Invalid data, skipping");
@@ -100,39 +122,37 @@ export function BusProvider({ children }) {
       }
       
       setBuses((prevBuses) => {
-        // Clean replacement - no merging of nested stale fields
+        const prev = prevBuses[data.busId] || {};
         const busData = {
           _id: data.busId,
           busId: data.busId,
           lat: data.latitude,
           lng: data.longitude,
-          snappedLat: data.snappedLat ?? null,  // Snapped coordinates (if within route corridor)
+          snappedLat: data.snappedLat ?? null,
           snappedLng: data.snappedLng ?? null,
           isSnapped: data.isSnapped || false,
           distanceFromRoute: data.distanceFromRoute ?? null,
-          speed: data.speed ?? 0,  // Raw GPS speed from backend (m/s)
-          derivedSpeed: data.derivedSpeed ?? null,  // Backend-derived stable speed (km/h)
+          speed: data.speed ?? 0,
+          derivedSpeed: data.derivedSpeed ?? prev.derivedSpeed ?? null,
           trackingActive: data.trackingActive !== false,
           lastUpdate: Date.now(),
-          // Route data from backend (if assigned)
           routeId: data.routeId || null,
           routeName: data.routeName || null,
           routeColor: data.routeColor || null,
-          routeCoords: data.routeCoords || null,  // Active route corridor coordinates
+          routeCoords: data.routeCoords ?? prev.routeCoords ?? null,
           direction: data.direction || null,
           tripId: data.tripId || null,
-          // Progression data from backend
-          currentStopId: data.currentStopId || null,
-          currentStopName: data.currentStopName || null,
-          nextStopId: data.nextStopId || null,
-          nextStopName: data.nextStopName || null,
-          passedStopIds: data.passedStopIds || [],
-          nextStopEtaMinutes: data.nextStopEtaMinutes ?? null,
-          remainingDistanceMeters: data.remainingDistanceMeters ?? null,
-          routeProgressIndex: data.routeProgressIndex ?? null,
+          currentStopId: data.currentStopId ?? prev.currentStopId ?? null,
+          currentStopName: data.currentStopName ?? prev.currentStopName ?? null,
+          nextStopId: data.nextStopId ?? prev.nextStopId ?? null,
+          nextStopName: data.nextStopName ?? prev.nextStopName ?? null,
+          passedStopIds: data.passedStopIds || prev.passedStopIds || [],
+          nextStopEtaMinutes: data.nextStopEtaMinutes ?? prev.nextStopEtaMinutes ?? null,
+          remainingDistanceMeters: data.remainingDistanceMeters ?? prev.remainingDistanceMeters ?? null,
+          routeProgressIndex: data.routeProgressIndex ?? prev.routeProgressIndex ?? null,
         };
         const newBuses = { ...prevBuses };
-        newBuses[data.busId] = busData;  // Direct assignment, no merge
+        newBuses[data.busId] = busData;
         console.log("[FLOW] Buses updated:", Object.keys(newBuses));
         return newBuses;
       });
@@ -152,6 +172,15 @@ export function BusProvider({ children }) {
       setBusProgress((prevProgress) => {
         const updated = { ...prevProgress };
         delete updated[busId];
+        return updated;
+      });
+      // Clear stale arrivals for offline bus
+      setStopArrivalsMap(prev => {
+        const updated = {};
+        Object.entries(prev).forEach(([stopId, stopData]) => {
+          const filtered = (stopData.arrivals || []).filter(a => a.busId !== busId);
+          if (filtered.length > 0) updated[stopId] = { ...stopData, arrivals: filtered };
+        });
         return updated;
       });
       // Reset follow if this bus was followed
@@ -198,6 +227,7 @@ export function BusProvider({ children }) {
       newSocket.off("BUS_LOCATION_UPDATE");
       newSocket.off("BUS_OFFLINE");
       newSocket.off("BUS_PROGRESS_UPDATE");
+      newSocket.off("STOP_ARRIVALS_UPDATE");
       newSocket.close();
     };
   }, []);
@@ -216,7 +246,8 @@ export function BusProvider({ children }) {
     selectedStop,
     setSelectedStop,
     selectedStopRoute,
-    setSelectedStopRoute
+    setSelectedStopRoute,
+    stopArrivalsMap
   };
 
   return <BusContext.Provider value={value}>{children}</BusContext.Provider>;

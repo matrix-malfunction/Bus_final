@@ -16,8 +16,8 @@ const BACKGROUND_LOCATION_TASK = "background-location-task";
 
 // BATTERY OPTIMIZATION: Minimum distance (meters) before sending update
 const MIN_DISTANCE_METERS = 10;
-// Minimum time (ms) between API calls - STRICT 5 SECOND THROTTLE
-const MIN_API_INTERVAL_MS = 5000;
+// DEBUG: Minimum time between API calls - reduced to 1s for diagnostic
+const MIN_API_INTERVAL_MS = 1000;
 // Max retry attempts for failed requests
 const MAX_RETRIES = 3;
 // AsyncStorage keys
@@ -485,14 +485,8 @@ export default function DriverTrackingScreen({
 
   // Send location to backend with retry queue and network awareness
   const sendLocationToBackend = async (location, attempt = 1, isFromQueue = false) => {
-    // Throttle: prevent rapid sends (4 second minimum)
     const now = Date.now();
-    if (now - lastSendTimeRef.current < 4000) {
-      console.log("[API] Throttled - too soon");
-      return;
-    }
-    lastSendTimeRef.current = now;
-    
+
     // BLOCK if tracking not active
     if (!global.__trackingActive) {
       console.log("[API] BLOCKED - tracking stopped");
@@ -500,7 +494,7 @@ export default function DriverTrackingScreen({
     }
 
     const { latitude, longitude, accuracy, altitude, heading } = location;
-    
+
     // GPS DRIFT FILTER: Skip low accuracy locations (>50m)
     // EXCEPTION: Allow first update after START even if accuracy is weak
     if (accuracy && accuracy > 50 && !firstUpdateAfterStartRef.current) {
@@ -513,17 +507,30 @@ export default function DriverTrackingScreen({
       console.log("[API] First update after START - accuracy bypass:", accuracy?.toFixed(1), "m");
       firstUpdateAfterStartRef.current = false;
     }
-    
+
     // IGNORE GPS speed - compute using Haversine instead (more reliable when stationary)
     const currLocation = { latitude, longitude, timestamp: now };
     const computedSpeedMps = calculateSpeed(fgLastLocation, currLocation);
     const finalSpeed = computedSpeedMps !== null ? computedSpeedMps : (location.speed || 0);
 
+    // MOVEMENT-AWARE THROTTLE: allow updates when bus genuinely moves
     const timeSinceLastSend = now - lastSendTimeRef.current;
-    if (timeSinceLastSend < MIN_API_INTERVAL_MS) {
-      console.log("[API] BLOCKED - throttled:", (MIN_API_INTERVAL_MS - timeSinceLastSend), "ms remaining");
+    let movedDistance = Infinity;
+    if (lastSentLocation) {
+      movedDistance = calculateDistance(
+        lastSentLocation.latitude,
+        lastSentLocation.longitude,
+        latitude,
+        longitude
+      );
+    }
+
+    if (timeSinceLastSend < MIN_API_INTERVAL_MS && movedDistance < 5) {
+      console.log("[API] BLOCKED - insufficient movement", {
+        movedDistance: movedDistance === Infinity ? "N/A" : movedDistance.toFixed(2),
+        timeSinceLastSend,
+      });
       if (!isFromQueue) {
-        // Add to queue for later processing
         setFailedQueue((prev) => {
           const newQueue = [...prev, { location, timestamp: now }];
           saveQueueToStorage(newQueue);
@@ -534,8 +541,8 @@ export default function DriverTrackingScreen({
       return;
     }
 
-    // Check if we should send (distance filter) - but not for queued items
-    if (!isFromQueue && lastSentLocation) {
+    // Distance filter for non-queued items (still require 10m unless throttle window expired)
+    if (!isFromQueue && lastSentLocation && timeSinceLastSend < MIN_API_INTERVAL_MS) {
       const distance = calculateDistance(
         lastSentLocation.latitude,
         lastSentLocation.longitude,
@@ -579,6 +586,14 @@ export default function DriverTrackingScreen({
     isSendingRef.current = true;
     lastSendTimeRef.current = now;
     setStatus(isFromQueue ? "Retrying updates..." : "Tracking • Online");
+
+    console.log("[DRIVER SEND]", {
+      lat: latitude,
+      lng: longitude,
+      speed: finalSpeed,
+      accuracy: accuracy || null,
+      timestamp: Date.now(),
+    });
 
     try {
       const requestBody = {
@@ -692,7 +707,7 @@ export default function DriverTrackingScreen({
       const item = failedQueue[i];
       await sendLocationToBackend(item.location, 1, true);
 
-      // Wait between items to respect 5s throttle
+      // Wait between items to respect throttle
       if (i < failedQueue.length - 1) {
         await new Promise(resolve => setTimeout(resolve, MIN_API_INTERVAL_MS));
       }
@@ -833,6 +848,7 @@ export default function DriverTrackingScreen({
       locationSubscriptionRef.current = subscription;
       setIsTracking(true);
       firstUpdateAfterStartRef.current = true;
+      lastSendTimeRef.current = 0; // DEBUG: ensure first GPS update is never blocked
       global.__trackingActive = true;
 
       // Transition to active state

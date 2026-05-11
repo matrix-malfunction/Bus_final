@@ -2719,26 +2719,43 @@ const HomeScreen = () => {
 
   useEffect(() => {
 
+    let subscription = null;
+
     (async () => {
 
       const { status } = await Location.requestForegroundPermissionsAsync();
 
       if (status !== "granted") return;
 
-
-
+      // Get initial location
       const loc = await Location.getCurrentPositionAsync({});
-
       const newLocation = {
         latitude: loc.coords.latitude,
         longitude: loc.coords.longitude,
       };
-
       setUserLocation(newLocation);
       setBusContextUserLocation(newLocation);
-      console.log("[HomeScreen] GPS update:", newLocation.latitude, newLocation.longitude);
+      console.log("[HomeScreen] Initial GPS:", newLocation.latitude, newLocation.longitude);
+
+      // Subscribe to continuous GPS updates
+      subscription = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.Balanced, timeInterval: 5000, distanceInterval: 10 },
+        (location) => {
+          const updated = {
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+          };
+          setUserLocation(updated);
+          setBusContextUserLocation(updated);
+          console.log("[HomeScreen] GPS update:", updated.latitude, updated.longitude);
+        }
+      );
 
     })();
+
+    return () => {
+      if (subscription) subscription.remove();
+    };
 
   }, []);
 

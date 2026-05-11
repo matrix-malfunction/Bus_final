@@ -30,7 +30,7 @@ export default function FullMapScreen({ route }) {
 
   // Default center (Chennai) - prevents crash when no route params
   const DEFAULT_CENTER = { latitude: 13.0827, longitude: 80.2707 };
-  const { buses: contextBuses, socket, followBusId, setFollowBusId, setUserLocation, busStops, busProgress, userLocation, selectedStopRoute, setSelectedStopRoute } = useBus();
+  const { buses: contextBuses, socket, followBusId, setFollowBusId, setUserLocation, busStops, busProgress, userLocation, selectedStopRoute, setSelectedStopRoute, stopArrivalsMap } = useBus();
 
   // Sync webViewReadyRef with state for stable checks in effects
   useEffect(() => {
@@ -54,25 +54,27 @@ export default function FullMapScreen({ route }) {
         const longitude = toFiniteCoordinate(bus?.longitude ?? bus?.lng);
         if (latitude === null || longitude === null) return null;
         
-        // Merge progression data if available
-        const progress = bus?.busId ? busProgress[bus.busId] : null;
-        
-        return {
+        // Progression fields already in bus from BUS_LOCATION_UPDATE:
+        // currentStopName, nextStopName, nextStopEtaMinutes, routeProgressIndex
+        // Preserve them in the spread above, ensure they are not undefined
+        const busWithProgression = {
           ...bus,
           latitude,
           longitude,
           lat: latitude,
-          // Add progression data for popup display
-          ...(progress && {
-            currentStopIndex: progress.currentStopIndex,
-            nextStopIndex: progress.nextStopIndex,
-            etaMinutes: progress.etaMinutes,
-            progressPercent: progress.progressPercent,
-            remainingDistanceKm: progress.remainingDistanceKm,
-          }),
           lng: longitude,
-          busId: bus.busId || bus._id
+          busId: bus.busId || bus._id,
+          // Ensure progression fields are explicitly set (not lost)
+          currentStopName: bus.currentStopName || null,
+          nextStopName: bus.nextStopName || null,
+          nextStopEtaMinutes: bus.nextStopEtaMinutes ?? null,
+          routeProgressIndex: bus.routeProgressIndex ?? null,
+          routeId: bus.routeId || null,
+          routeName: bus.routeName || null,
+          direction: bus.direction || null
         };
+
+        return busWithProgression;
       })
       .filter(Boolean);
   }, [routeBuses, contextBuses, busProgress]);
@@ -140,6 +142,15 @@ export default function FullMapScreen({ route }) {
               progression: busProgress?.[bus.busId] || null,
             }));
           console.log("[FullMap RN] Sending BUS_UPDATE after MAP_READY:", latestBuses.length, "buses");
+          console.log("[FULLMAP POSTMESSAGE]", latestBuses.map(b => ({
+            busId: b.busId,
+            currentStopName: b.currentStopName,
+            nextStopName: b.nextStopName,
+            nextStopEtaMinutes: b.nextStopEtaMinutes,
+            direction: b.direction,
+            derivedSpeed: b.derivedSpeed,
+            speed: b.speed,
+          })));
 
           webViewRef.current.postMessage(
             JSON.stringify({
@@ -177,8 +188,28 @@ export default function FullMapScreen({ route }) {
 
       // SET_FOLLOW from WebView (popup toggle - final state)
       if (data.type === "SET_FOLLOW") {
-        console.log("[FullMap] SET_FOLLOW:", data.busId);
-        setFollowBusId(data.busId || null); // Direct set, no toggle logic
+        const { busId, follow } = data;
+
+        console.log(
+          "[FullMap] SET_FOLLOW:",
+          busId,
+          follow
+        );
+
+        const nextFollowBusId =
+          follow ? busId : null;
+
+        // Prevent duplicate follow updates
+        if (followBusId === nextFollowBusId) {
+          console.log(
+            "[FOLLOW] Ignored duplicate follow state",
+            nextFollowBusId
+          );
+
+          return;
+        }
+
+        setFollowBusId(nextFollowBusId);
       }
 
       // SOS_ACK from WebView (user clicked ACK button)
@@ -234,6 +265,7 @@ export default function FullMapScreen({ route }) {
 
     lastUserLocationRef.current = { lat, lng };
 
+    console.log("[FullMap] Context userLocation:", lat, lng);
     console.log("[RN FullMap] Sending USER_LOCATION", lat, lng);
 
     webViewRef.current.postMessage(JSON.stringify({
@@ -258,6 +290,15 @@ export default function FullMapScreen({ route }) {
     );
 
     console.log("[FullMap RN] Sending BUS_UPDATE:", activeBuses.length, "buses");
+    console.log("[FULLMAP POSTMESSAGE]", activeBuses.map(b => ({
+      busId: b.busId,
+      currentStopName: b.currentStopName,
+      nextStopName: b.nextStopName,
+      nextStopEtaMinutes: b.nextStopEtaMinutes,
+      direction: b.direction,
+      derivedSpeed: b.derivedSpeed,
+      speed: b.speed,
+    })));
     webViewRef.current.postMessage(
       JSON.stringify({
         type: "BUS_UPDATE",
@@ -523,6 +564,16 @@ export default function FullMapScreen({ route }) {
     userLocation,
     webViewReady
   ]);
+
+  // Send stop arrivals map to WebView on change
+  useEffect(() => {
+    if (!webViewReady || !webViewRef.current || !stopArrivalsMap) return;
+    console.log("[FULLMAP STOP ARRIVALS]", Object.keys(stopArrivalsMap).length);
+    webViewRef.current.postMessage(JSON.stringify({
+      type: "STOP_ARRIVALS_UPDATE",
+      stopArrivalsMap
+    }));
+  }, [stopArrivalsMap, webViewReady]);
 
   // Send toggle state to WebView when it changes
   useEffect(() => {
@@ -1250,6 +1301,66 @@ export default function FullMapScreen({ route }) {
             }).setView([${Number(center.latitude)}, ${Number(center.longitude)}], 14);
             window.map = map;
 
+            // Follow button delegated listener (attached once)
+            if (!window.__followListenerAttached) {
+              window.__followListenerAttached = true;
+
+              document.addEventListener(
+                "click",
+                function(e) {
+                  const btn = e.target.closest(".follow-btn");
+
+                  if (!btn) return;
+
+                  // Ignore synthetic/non-user events
+                  if (!e.isTrusted) {
+                    console.log(
+                      "[FOLLOW] Ignored synthetic click"
+                    );
+                    return;
+                  }
+
+                  // Prevent Leaflet popup bubbling
+                  e.preventDefault();
+                  e.stopPropagation();
+
+                  const busId = btn.dataset.busid;
+
+                  const follow =
+                    btn.dataset.follow === "true";
+
+                  // Prevent rapid duplicate taps
+                  const now = Date.now();
+
+                  if (
+                    window.__lastFollowClick &&
+                    now - window.__lastFollowClick < 500
+                  ) {
+                    console.log(
+                      "[FOLLOW] Ignored rapid duplicate click"
+                    );
+                    return;
+                  }
+
+                  window.__lastFollowClick = now;
+
+                  console.log("[FOLLOW CLICK]", {
+                    busId,
+                    follow,
+                  });
+
+                  window.ReactNativeWebView.postMessage(
+                    JSON.stringify({
+                      type: "SET_FOLLOW",
+                      busId,
+                      follow,
+                    })
+                  );
+                },
+                true
+              );
+            }
+
             L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(window.map);
 
             // 2) REMOVE ANY INJECTED LAYER CONTROLS (safeguard)
@@ -1637,146 +1748,43 @@ export default function FullMapScreen({ route }) {
 
             // Route-aware popup with bus metadata and progression
             function createPopupHTML(bus) {
-              const isFollowing = window.__followBusId === (bus.busId || bus.id);
-              const checkedAttr = isFollowing ? 'checked' : '';
-              const labelText = isFollowing ? 'Following' : 'Follow';
-              const busId = bus.busId || bus.id || "Unknown";
-              
-              // Route info (fallback gracefully if missing)
-              const routeName = bus.routeName || bus.route || null;
-              const direction = bus.direction || null;
-              const tripId = bus.tripId || null;
-              
-              // Speed - Backend-authoritative (derivedSpeed from backend, fallback to raw GPS)
-              const displaySpeed = Number.isFinite(bus.derivedSpeed)
-                ? Math.round(bus.derivedSpeed)
-                : (bus.speed !== undefined ? Math.round(bus.speed * 3.6) : null);
-              const speedKmh = displaySpeed;
-              
-              // Direction heading
-              const heading = bus.heading !== undefined ? Math.round(bus.heading) : null;
-              
-              // Last update age
-              const lastUpdate = bus.lastUpdate || bus.timestamp || Date.now();
-              const now = Date.now();
-              const ageSeconds = Math.floor((now - lastUpdate) / 1000);
-              let ageText = '';
-              if (ageSeconds < 60) {
-                ageText = ageSeconds + 's ago';
-              } else if (ageSeconds < 3600) {
-                ageText = Math.floor(ageSeconds / 60) + 'm ago';
-              } else {
-                ageText = Math.floor(ageSeconds / 3600) + 'h ago';
-              }
-              
-              // Tracking status with badge
-              const isTracking = bus.trackingActive !== false;
-              const trackingStatus = isTracking ? "Active" : "Paused";
-              const trackingBadge = isTracking 
-                ? '<span class="tracking-badge tracking-badge-active">● Active</span>'
-                : '<span class="tracking-badge tracking-badge-paused">○ Paused</span>';
-              
-              // Freshness badge based on timestamp age
-              const freshnessState = bus.__freshnessState || calculateFreshnessState(bus.timestamp || bus.lastUpdate);
-              let freshnessBadge = '';
-              if (freshnessState === 'live') {
-                freshnessBadge = '<span class="freshness-badge freshness-badge-live">● Live</span>';
-              } else if (freshnessState === 'stale') {
-                freshnessBadge = '<span class="freshness-badge freshness-badge-stale">● Stale</span>';
-              } else if (freshnessState === 'offline') {
-                freshnessBadge = '<span class="freshness-badge freshness-badge-offline">● Offline</span>';
-              }
-              
-              // Progression data (backend-driven) - support both direct and nested progression
-              const prog = bus.progression || bus;
-              const progressPercent = prog.progressPercent !== undefined ? prog.progressPercent : null;
-              const etaMinutes = prog.etaMinutes !== undefined ? prog.etaMinutes : null;
-              const currentStopIndex = prog.currentStopIndex !== undefined ? prog.currentStopIndex : null;
-              const nextStopIndex = prog.nextStopIndex !== undefined ? prog.nextStopIndex : null;
-              const remainingDistanceKm = prog.remainingDistanceKm !== undefined ? prog.remainingDistanceKm : null;
-              // Live stop progression fields
-              const currentStopName = prog.currentStopName || null;
-              const nextStopName = prog.nextStopName || null;
-              const nextStopEtaMinutes = prog.nextStopEtaMinutes !== undefined ? prog.nextStopEtaMinutes : null;
-              
-              // Build route section
-              let routeHtml = '';
-              if (routeName) {
-                routeHtml += '<div class="bus-popup-row bus-popup-route">' + routeName + '</div>';
-              }
-              if (direction) {
-                routeHtml += '<div class="bus-popup-row bus-popup-direction">' + direction + '</div>';
-              }
-              
-              // Build metadata section
-              let metaHtml = '';
-              if (speedKmh !== null) {
-                metaHtml += '<div class="bus-popup-row">Speed: ' + speedKmh + ' km/h';
-                if (heading !== null) {
-                  metaHtml += ' <span class="heading-arrow">→ ' + heading + '°</span>';
-                }
-                metaHtml += '</div>';
-              }
-              metaHtml += '<div class="bus-popup-row">Updated: ' + ageText + '</div>';
-              metaHtml += '<div class="bus-popup-row">Signal: ' + freshnessBadge + '</div>';
-              metaHtml += '<div class="bus-popup-row">Tracking: ' + trackingBadge + '</div>';
-              if (tripId) {
-                metaHtml += '<div class="bus-popup-row bus-popup-trip">ID: ' + tripId.slice(-6) + '</div>';
-              }
-              
-              // Build live stop progression section (backend-driven)
-              // PROGRESSION GUARD: Skip if no valid progression data
-              const hasValidProgression = nextStopName || currentStopName || (remainingDistanceKm !== null && remainingDistanceKm > 0);
-              let progressHtml = '';
+              const speed = bus.derivedSpeed ?? bus.speed ?? 0;
+              const eta = bus.nextStopEtaMinutes;
+              const currentStop = bus.currentStopName || "N/A";
+              const nextStop = bus.nextStopName || "N/A";
+              const direction = bus.direction || "N/A";
+              const isFollowing = window.__followBusId === bus.busId;
 
-              if (hasValidProgression) {
-                // Primary: Next Stop with ETA (most important for passengers)
-                if (nextStopName) {
-                  const etaText = nextStopEtaMinutes !== null ? '<span class="stop-eta">' + nextStopEtaMinutes + ' min</span>' : '';
-                  const distanceText = remainingDistanceKm !== null ? '<span style="color:#666;font-size:11px;margin-left:8px;">' + remainingDistanceKm.toFixed(1) + ' km</span>' : '';
-                  progressHtml += '<div class="bus-popup-row bus-popup-next-stop" style="font-size:14px;margin:8px 0;">' +
-                    '<strong style="color:#2563eb;">→ Next:</strong> ' + escapeText(nextStopName) + etaText + distanceText + '</div>';
-                }
+              // Harden speed display
+              const safeSpeed = Number.isFinite(speed) ? Math.max(0, Math.round(speed)) : 0;
 
-                // Secondary: Current stop context
-                if (currentStopName) {
-                  progressHtml += '<div class="bus-popup-row bus-popup-current-stop" style="font-size:12px;color:#666;">' +
-                    '<strong>At:</strong> ' + escapeText(currentStopName) + '</div>';
-                }
-
-                // Progress percent as visual indicator
-                if (progressPercent !== null && progressPercent > 0) {
-                  progressHtml += '<div class="bus-popup-row" style="margin-top:6px;">' +
-                    '<div style="background:#e5e7eb;height:4px;border-radius:2px;overflow:hidden;">' +
-                    '<div style="background:#10b981;height:100%;width:' + progressPercent + '%;"></div>' +
+              return (
+                '<div class="bus-popup" style="min-width:220px;padding:4px;">' +
+                  '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
+                    '<div style="font-weight:bold;font-size:16px;">' +
+                      (bus.busId || "Unknown Bus") +
                     '</div>' +
-                    '<div style="text-align:center;font-size:10px;color:#666;margin-top:2px;">' + progressPercent + '% complete</div>' +
-                    '</div>';
-                }
-              } else {
-                // Fallback to legacy progression display if stop names not available
-                if (progressPercent !== null) {
-                  progressHtml += '<div class="bus-popup-row">Progress: ' + progressPercent + '%</div>';
-                }
-                if (etaMinutes !== null) {
-                  progressHtml += '<div class="bus-popup-row">ETA: ' + etaMinutes + ' min</div>';
-                }
-                if (remainingDistanceKm !== null) {
-                  progressHtml += '<div class="bus-popup-row">Remaining: ' + remainingDistanceKm.toFixed(1) + ' km</div>';
-                }
-              }
-              
-              return '<div class="bus-popup">' +
-                '<div class="bus-popup-header">Bus: ' + busId + '</div>' +
-                (routeName || direction ? '<div class="bus-popup-section">' + routeHtml + '</div>' : '') +
-                '<div class="bus-popup-section">' + metaHtml + '</div>' +
-                (progressHtml ? '<div class="bus-popup-section bus-popup-progress">' + progressHtml + '</div>' : '') +
-                '<label class="follow-toggle">' +
-                  '<input type="checkbox" ' + checkedAttr + ' data-bus-id="' + busId + '">' +
-                  '<span class="toggle-slider"></span>' +
-                  '<span class="toggle-label">' + labelText + '</span>' +
-                '</label>' +
-              '</div>';
+                    '<div style="background:' + (bus.routeColor || "#2563eb") + ';color:white;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:bold;">' +
+                      direction +
+                    '</div>' +
+                  '</div>' +
+                  '<div style="margin-top:4px;">' +
+                    '<strong>Speed:</strong> ' + safeSpeed + ' km/h' +
+                  '</div>' +
+                  '<div style="margin-top:4px;">' +
+                    '<strong>Current Stop:</strong> ' + currentStop +
+                  '</div>' +
+                  '<div style="margin-top:4px;">' +
+                    '<strong>Next Stop:</strong> ' + nextStop +
+                  '</div>' +
+                  '<div style="margin-top:4px;">' +
+                    '<strong>ETA:</strong> ' + (eta != null ? eta + ' min' : '-- min') +
+                  '</div>' +
+                  '<button class="follow-btn" data-busid="' + bus.busId + '" data-follow="' + !isFollowing + '" style="margin-top:10px;width:100%;padding:10px;border:none;border-radius:10px;background:' + (isFollowing ? '#dc2626' : '#2563eb') + ';color:white;font-weight:bold;cursor:pointer;">' +
+                    (isFollowing ? 'Stop Following' : 'Follow Bus') +
+                  '</button>' +
+                '</div>'
+              );
             }
 
             // 3b) ETA CALCULATION - Backend-authoritative speed
@@ -1798,26 +1806,7 @@ export default function FullMapScreen({ route }) {
               return Math.round(eta / 60);
             }
 
-            // 3b) UPDATE BUS POPUP (keeps popup in sync with bus data)
-            function updateBusPopup(marker, bus) {
-              if (!marker || !marker.getPopup()) return;
-
-              // Deduplication: only update if content changed
-              const newContent = createPopupHTML(bus);
-              const currentContent = marker.getPopup().getContent();
-              if (newContent !== currentContent) {
-                marker.setPopupContent(newContent);
-              }
-              
-              // If following this bus, ensure popup stays open
-              if (window.__followBusId === (bus.busId || bus.id)) {
-                if (!marker.getPopup().isOpen()) {
-                  marker.openPopup();
-                }
-              }
-            }
-
-            // 3c) TOGGLE FOLLOW (called from popup) with optimistic UI update
+            // 3b) TOGGLE FOLLOW (called from popup) with optimistic UI update
             window.toggleFollow = function(busId) {
               // Optimistic update: toggle immediately
               const wasFollowing = window.__followBusId === busId;
@@ -1982,11 +1971,32 @@ export default function FullMapScreen({ route }) {
                     marker.__freshnessState = freshnessState; // Store for popup updates
                   }
 
-                  // 9. Merge data for popup updates
-                  marker.__busData = { ...marker.__busData, ...bus, id, eta };
+                  marker.__busData = {
+                    ...marker.__busData,
+                    ...bus,
+                    id,
+                    eta,
+                  };
 
-                  // 10. Update popup content (if open or following)
-                  updateBusPopup(marker, marker.__busData);
+                  console.log("[MARKER UPDATE]", {
+                    busId: marker.__busData.busId,
+                    currentStopName: marker.__busData.currentStopName,
+                    nextStopName: marker.__busData.nextStopName,
+                    nextStopEtaMinutes: marker.__busData.nextStopEtaMinutes,
+                    derivedSpeed: marker.__busData.derivedSpeed,
+                    speed: marker.__busData.speed,
+                  });
+
+                  if (marker.isPopupOpen()) {
+                    const freshHtml = createPopupHTML(marker.__busData);
+
+                    marker.setPopupContent(freshHtml);
+
+                    console.log(
+                      "[POPUP REFRESHED]",
+                      marker.__busData.busId
+                    );
+                  }
 
                   // 11. Update z-index based on marker hierarchy
                   // Hierarchy: Followed bus > Arriving > SOS > Normal buses > Stops > Corridor
@@ -2169,6 +2179,7 @@ export default function FullMapScreen({ route }) {
             window.__busStops = [];
             window.__busStopMarkers = {}; // Registry of all stop markers by ID
             window.__stopBusMap = {}; // stopId → [busIds]
+            window.stopArrivalsMap = {}; // Realtime arrivals cache: stopId → { arrivals }
             window.__stopRouteLine = null; // Temporary route line layer
             window.__stopsReady = false; // Flag: markers fully rendered
             window.__pendingSelectedStop = null; // Queue for early SELECT_STOP
@@ -2279,26 +2290,45 @@ function computeStopBusMapping(buses) {
   });
 }
 
-// Update stop popup with buses
+// Build arrival-aware stop popup HTML (reads from window.stopArrivalsMap)
+function createStopPopupHTML(stopId, stopName) {
+  const stopData = window.stopArrivalsMap && window.stopArrivalsMap[stopId];
+  const arrivals = (stopData && stopData.arrivals) ? stopData.arrivals : [];
+
+  const statusColors = { AT_STOP: '#007AFF', ARRIVING: '#10B981', UPCOMING: '#FF9500', DEPARTED: '#9CA3AF' };
+  const statusDots  = { AT_STOP: '🔵', ARRIVING: '🟢', UPCOMING: '🟡', DEPARTED: '⚫' };
+
+  let html = '<div style="min-width:160px;">';
+  html += '<div style="font-weight:700;font-size:13px;margin-bottom:6px;color:#1f2937;">' + (stopName || 'Bus Stop') + '</div>';
+
+  if (arrivals.length === 0) {
+    html += '<div style="font-size:12px;color:#9CA3AF;">No buses arriving</div>';
+  } else {
+    arrivals.slice(0, 5).forEach(function(a) {
+      const dot   = statusDots[a.status]  || '⚪';
+      const color = statusColors[a.status] || '#6B7280';
+      const eta   = a.status === 'AT_STOP' ? 'At Stop' : (a.etaMinutes != null ? a.etaMinutes + ' min' : '—');
+      const label = a.routeName || a.busId;
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">';
+      html += '<span style="font-size:12px;">' + dot + ' ' + label + '</span>';
+      html += '<span style="font-size:12px;font-weight:600;color:' + color + ';margin-left:8px;">' + eta + '</span>';
+      html += '</div>';
+      if (a.currentStopName) {
+        html += '<div style="font-size:10px;color:#6B7280;margin-left:16px;margin-bottom:2px;">Now: ' + a.currentStopName + '</div>';
+      }
+    });
+  }
+
+  html += '</div>';
+  return html;
+}
+
+// Update stop popup with arrivals data
 function updateStopPopups() {
   Object.keys(window.__busStopMarkers).forEach(function(stopId) {
     const marker = window.__busStopMarkers[stopId];
-    if (!marker) return;
-
-    const busIds = window.__stopBusMap[stopId] || [];
-    const stopName = marker.__stopName || 'Bus Stop';
-
-    let content = '<b>' + stopName + '</b><br>';
-
-    if (busIds.length > 0) {
-      content += '<span style="font-size:12px;color:#666;">Buses: ' + busIds.length + '</span>';
-    } else {
-      content += '<span style="font-size:12px;color:#999;">No buses nearby</span>';
-    }
-
-    if (marker.getPopup()) {
-      marker.setPopupContent(content);
-    }
+    if (!marker || !marker.getPopup()) return;
+    marker.setPopupContent(createStopPopupHTML(stopId, marker.__stopName || 'Bus Stop'));
   });
 }
 
@@ -2691,9 +2721,7 @@ function renderBusStops() {
 
       marker.__stopName = stop.name;
       marker.__stopId = stopId; // Store normalized ID on marker
-      marker.bindPopup(
-        '<b>' + stop.name + '</b><br><span style="font-size:12px;color:#999;">Loading...</span>'
-      );
+      marker.bindPopup(createStopPopupHTML(stopId, stop.name));
 
       window.__busStopMarkers[stopId] = marker;
       added++;
@@ -3818,6 +3846,18 @@ window.map.on("zoomend", function() {
                   } else {
                     console.log("[WEBVIEW] SOS_CLEARED: no marker found", clearBusId);
                   }
+                  break;
+
+                case "STOP_ARRIVALS_UPDATE":
+                  window.stopArrivalsMap = data.stopArrivalsMap || {};
+                  console.log("[WEBVIEW] STOP_ARRIVALS_UPDATE:", Object.keys(window.stopArrivalsMap).length, "stops");
+                  // Refresh only open stop popups — no marker recreation
+                  Object.keys(window.__busStopMarkers || {}).forEach(function(stopId) {
+                    const marker = window.__busStopMarkers[stopId];
+                    if (marker && marker.isPopupOpen()) {
+                      marker.setPopupContent(createStopPopupHTML(stopId, marker.__stopName));
+                    }
+                  });
                   break;
 
                 case "RECENTER":
