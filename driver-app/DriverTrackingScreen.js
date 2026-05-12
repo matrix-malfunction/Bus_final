@@ -26,6 +26,117 @@ const LAST_SENT_KEY = "@driver_last_sent";
 const LAST_LOCATION_KEY = "@driver_last_location";
 const BUS_ID_KEY = "bus_id";
 const TOKEN_KEY = "@auth_token";
+
+// ─────────────────────────────────────────────
+// DEV-ONLY: Fake GPS injector for route corridor testing
+// ⚠️  Set DEV_ROUTE_SIMULATION = false before production build
+// ─────────────────────────────────────────────
+const DEV_ROUTE_SIMULATION = true;
+global.__devRouteSimulation = DEV_ROUTE_SIMULATION; // Expose for background task guard
+
+// Demo-safe: stops farther than this from route are skipped silently
+const MAX_STOP_DISTANCE_METERS = 120;
+
+// Aligned to VLR_11_DEMO: coordinates[i] === stops[i], no east detour.
+const TEST_ROUTE_POINTS = [
+  { lat: 12.9772, lng: 79.1368 },  // [0] katpadi_main      — Katpadi Bus Stand (Main)
+  { lat: 12.9711, lng: 79.1372 },  // [1] katpadi_junction  — Katpadi Junction Bus Stop
+  { lat: 12.9663, lng: 79.1375 },  // [2] katpadi_chittoor  — Katpadi – Chittoor Bus Stand
+  { lat: 12.9346, lng: 79.1384 },  // [3] custom_stop_117   — Vellore Mofussil Bus Terminus
+  { lat: 12.9245, lng: 79.1333 },  // [4] custom_stop_116   — CMC Bus Stop
+  { lat: 12.9113, lng: 79.1305 },  // [5] custom_stop_138   — Infantry Road Stop
+  { lat: 12.9107, lng: 79.1276 },  // [6] custom_stop_140   — Vellore Cantonment Station
+  { lat: 12.8881, lng: 79.1221 },  // [7] custom_stop_134   — Vellore (Near Jail) Bus Stop
+  { lat: 12.8801, lng: 79.1348 },  // [8] bagayam           — Bagayam Bus Stop
+];
+
+// ─────────────────────────────────────────────
+// DENSE ROUTE BUILDER: interpolate between sparse points for smooth demo movement
+// ─────────────────────────────────────────────
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function getRandomCruiseSpeed() {
+  return 30 + Math.random() * 35; // 30-65 km/h
+}
+
+function interpolateSegment(start, end, steps, segmentIndex) {
+  const points = [];
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    points.push({
+      lat: start.lat + (end.lat - start.lat) * t,
+      lng: start.lng + (end.lng - start.lng) * t,
+      segmentIndex,
+      segmentProgress: t,
+    });
+  }
+  return points;
+}
+
+const haversineMeters = (lat1, lon1, lat2, lon2) => {
+  const R = 6371000;
+
+  const toRad = (deg) => (deg * Math.PI) / 180;
+
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return R * c;
+};
+
+function buildDenseRoute(sparsePoints, targetSpacingMeters = 25) {
+  const totalSegments = sparsePoints.length - 1;
+  const dense = [{ ...sparsePoints[0], segmentIndex: 0, segmentProgress: 0, routeProgress: 0 }];
+  for (let i = 0; i < totalSegments; i++) {
+    const start = sparsePoints[i];
+    const end = sparsePoints[i + 1];
+    const segmentDistance = haversineMeters(start.lat, start.lng, end.lat, end.lng);
+    const steps = Math.max(3, Math.ceil(segmentDistance / targetSpacingMeters));
+    for (let j = 1; j < steps; j++) {
+      const t = j / steps;
+      dense.push({
+        lat: start.lat + (end.lat - start.lat) * t,
+        lng: start.lng + (end.lng - start.lng) * t,
+        segmentIndex: i,
+        segmentProgress: t,
+        routeProgress: (i + t) / totalSegments,
+      });
+    }
+    dense.push({ ...end, segmentIndex: i, segmentProgress: 1, routeProgress: (i + 1) / totalSegments });
+  }
+  return dense;
+}
+
+function computeRemainingDistanceMeters(coords, segmentIndex, segmentProgress) {
+  if (!coords || coords.length < 2) return 0;
+  let remaining = 0;
+  // Partial current segment
+  const segStart = coords[segmentIndex];
+  const segEnd = coords[Math.min(segmentIndex + 1, coords.length - 1)];
+  const segDist = haversineMeters(segStart[0], segStart[1], segEnd[0], segEnd[1]);
+  remaining += segDist * (1 - segmentProgress);
+  // All remaining full segments
+  for (let i = segmentIndex + 1; i < coords.length - 1; i++) {
+    remaining += haversineMeters(coords[i][0], coords[i][1], coords[i + 1][0], coords[i + 1][1]);
+  }
+  return Math.round(remaining);
+}
+
+// Pre-built dense route for OUTBOUND; INBOUND reverses on the fly
+const DENSE_ROUTE_OUTBOUND = buildDenseRoute(TEST_ROUTE_POINTS, 25);
+console.log("[DEV GPS] Dense route built:", DENSE_ROUTE_OUTBOUND.length, "points from", TEST_ROUTE_POINTS.length, "stops");
+
 // Global variables for background task (TaskManager cannot access AsyncStorage)
 global.bgBusId = null;
 global.bgToken = null;
@@ -47,19 +158,6 @@ const FORCE_UPDATE_INTERVAL_MS = 15000; // Force heartbeat update every 15 secon
 
 // Helper: async delay (replaces setTimeout)
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-// Haversine distance calculation (for GPS filtering)
-const haversineMeters = (lat1, lng1, lat2, lng2) => {
-  const R = 6371e3; // Earth radius in meters
-  const φ1 = (lat1 * Math.PI) / 180;
-  const φ2 = (lat2 * Math.PI) / 180;
-  const Δφ = ((lat2 - lat1) * Math.PI) / 180;
-  const Δλ = ((lng2 - lng1) * Math.PI) / 180;
-  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-};
 
 // Calculate speed using Haversine distance and time delta
 // Replaces unreliable GPS speed when stationary
@@ -193,6 +291,12 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
       return;
     }
 
+    // DEV SIMULATION BLOCK: do not emit real GPS during demo mode
+    if (global.__devRouteSimulation) {
+      console.log("[BG TASK] BLOCKED - simulation mode active");
+      return;
+    }
+
     // Build request body without fallbacks
     const requestBody = {
       busId,
@@ -314,6 +418,25 @@ export default function DriverTrackingScreen({
   const trackingStartInFlightRef = useRef(false); // Prevent duplicate tracking starts
   const trackingLifecycleRef = useRef("idle"); // idle | starting | active | stopping
   const firstUpdateAfterStartRef = useRef(false); // Allow first GPS update even with weak accuracy
+  const simulationRef = useRef({
+    segmentIndex: 0,
+    segmentProgress: 0,
+    currentStopIndex: 0,
+    speed: 0,
+    targetSpeed: 35,
+    speedCurrent: 0,
+    speedTarget: 35,
+    speedLastChange: 0,
+    stopUntil: 0,
+    initialStopHoldUntil: 0,
+    lastHeldStopIndex: -1,
+    avgSpeed: 0,
+    etaSmoothed: null,
+    direction: direction || "OUTBOUND",
+  });
+  const routeDataRef = useRef(null);
+  const denseCoordsRef = useRef(null);
+  const devSimIntervalRef = useRef(null);           // DEV: simulation interval handle
 
   // Calculate distance between two coordinates (Haversine formula)
   const calculateDistance = (lat1, lng1, lat2, lng2) => {
@@ -493,7 +616,13 @@ export default function DriverTrackingScreen({
       return;
     }
 
-    const { latitude, longitude, accuracy, altitude, heading } = location;
+    // DEV SIMULATION BLOCK: do not emit real GPS during demo mode
+    if (DEV_ROUTE_SIMULATION) {
+      console.log("[API] BLOCKED - simulation mode active");
+      return;
+    }
+
+    let { latitude, longitude, accuracy, altitude, heading } = location;
 
     // GPS DRIFT FILTER: Skip low accuracy locations (>50m)
     // EXCEPTION: Allow first update after START even if accuracy is weak
@@ -511,7 +640,7 @@ export default function DriverTrackingScreen({
     // IGNORE GPS speed - compute using Haversine instead (more reliable when stationary)
     const currLocation = { latitude, longitude, timestamp: now };
     const computedSpeedMps = calculateSpeed(fgLastLocation, currLocation);
-    const finalSpeed = computedSpeedMps !== null ? computedSpeedMps : (location.speed || 0);
+    let finalSpeed = computedSpeedMps !== null ? computedSpeedMps : (location.speed || 0);
 
     // MOVEMENT-AWARE THROTTLE: allow updates when bus genuinely moves
     const timeSinceLastSend = now - lastSendTimeRef.current;
@@ -689,6 +818,12 @@ export default function DriverTrackingScreen({
       console.log("[QUEUE] Flush cancelled - tracking stopped");
       return;
     }
+
+    // DEV SIMULATION BLOCK: do not flush real GPS during demo mode
+    if (DEV_ROUTE_SIMULATION) {
+      console.log("[QUEUE] Flush blocked - simulation mode active");
+      return;
+    }
     
     if (failedQueue.length === 0 || flushInProgressRef.current) return;
 
@@ -725,6 +860,387 @@ export default function DriverTrackingScreen({
     const socket = io(API_BASE_URL);
     socketRef.current = socket;
     return () => socket.disconnect();
+  }, []);
+
+  // Fetch full route details (stops + routeCoords) for simulation
+  useEffect(() => {
+    if (!DEV_ROUTE_SIMULATION || !routeId) return;
+
+    fetch(`${API_BASE_URL}/api/routes/${routeId}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.route) {
+          routeDataRef.current = data.route;
+          // Densify routeCoords for smooth movement (~15m spacing)
+          const sparse = data.route.routeCoords;
+          if (sparse && sparse.length >= 2) {
+            const dense = [sparse[0]];
+            for (let i = 0; i < sparse.length - 1; i++) {
+              const start = sparse[i];
+              const end = sparse[i + 1];
+              const segDist = haversineMeters(start[0], start[1], end[0], end[1]);
+              const steps = Math.max(3, Math.ceil(segDist / 15));
+              for (let j = 1; j < steps; j++) {
+                const t = j / steps;
+                dense.push([
+                  start[0] + (end[0] - start[0]) * t,
+                  start[1] + (end[1] - start[1]) * t,
+                ]);
+              }
+              dense.push([end[0], end[1]]);
+            }
+            denseCoordsRef.current = dense;
+            console.log('[SIMULATION] Densified route:', data.route.name, 'stops:', data.route.stops?.length, 'sparse:', sparse.length, 'dense:', dense.length);
+          }
+        }
+      })
+      .catch((err) => console.log('[SIMULATION] Failed to load route:', err.message));
+  }, []);
+
+  // DEV ONLY: Stop-aware simulation interval
+  useEffect(() => {
+    if (!DEV_ROUTE_SIMULATION) return;
+
+    const interval = setInterval(() => {
+      if (!global.__trackingActive) return;
+
+      const route = routeDataRef.current;
+      const denseCoords = denseCoordsRef.current;
+      if (!route || !route.stops || route.stops.length < 2 || !denseCoords || denseCoords.length < 2) {
+        console.log('[SIM] Invalid route data');
+        return;
+      }
+
+      const s = simulationRef.current;
+      const now = Date.now();
+
+      // Direction-aware copies
+      let activeStops = route.stops;
+      let activeCoords = denseCoords;
+      if (s.direction === "INBOUND") {
+        activeStops = [...route.stops].reverse();
+        activeCoords = [...denseCoords].reverse();
+      }
+
+      console.log('[SIMULATION TICK]', {
+        trackingActive: global.__trackingActive,
+        denseCoordsLength: activeCoords.length,
+        stopsLength: activeStops.length,
+        segmentIndex: s.segmentIndex,
+        segmentProgress: Math.round(s.segmentProgress * 1000) / 1000,
+        currentStopIndex: s.currentStopIndex,
+        direction: s.direction,
+        speed: Math.round(s.speed * 10) / 10,
+        avgSpeed: Math.round(s.avgSpeed * 10) / 10,
+      });
+
+      // INITIAL STOP HOLD: bus sits at first stop for realistic startup
+      if (s.initialStopHoldUntil > now) {
+        const stop = activeStops[s.currentStopIndex];
+        const lat = stop ? stop.lat : activeCoords[0][0];
+        const lng = stop ? stop.lng : activeCoords[0][1];
+        const nextStop = activeStops[s.currentStopIndex + 1];
+        const currentStopName = stop?.name || null;
+        const nextStopName = nextStop?.name || null;
+
+        // POST during initial hold
+        const initialHoldRemaining = computeRemainingDistanceMeters(activeCoords, s.segmentIndex, s.segmentProgress);
+        fetch(`${API_BASE_URL}/api/driver/location`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token && { "Authorization": `Bearer ${token}` }),
+          },
+          body: JSON.stringify({
+            busId,
+            lat: lat,
+            lng: lng,
+            speed: 0,
+            remainingDistanceMeters: initialHoldRemaining,
+            source: "simulation",
+            trackingActive: true,
+          }),
+        }).catch((err) => console.log("[SIMULATION POST] Failed:", err.message));
+
+        console.log("[SIMULATION STARTUP HOLD]", {
+          currentStopName,
+          nextStopName,
+          remainingMs: s.initialStopHoldUntil - now,
+        });
+        return;
+      }
+
+      // STOP HOLD: paused at a stop
+      if (s.stopUntil > now) {
+        const stop = activeStops[s.currentStopIndex];
+        const lat = stop ? stop.lat : activeCoords[0][0];
+        const lng = stop ? stop.lng : activeCoords[0][1];
+        const nextStop = activeStops[s.currentStopIndex + 1];
+        const currentStopName = stop?.name || null;
+        const nextStopName = nextStop?.name || null;
+
+        // POST during stop hold
+        const stopHoldRemaining = computeRemainingDistanceMeters(activeCoords, s.segmentIndex, s.segmentProgress);
+        fetch(`${API_BASE_URL}/api/driver/location`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token && { "Authorization": `Bearer ${token}` }),
+          },
+          body: JSON.stringify({
+            busId,
+            lat: lat,
+            lng: lng,
+            speed: 0,
+            remainingDistanceMeters: stopHoldRemaining,
+            source: "simulation",
+            trackingActive: true,
+          }),
+        }).catch((err) => console.log("[SIMULATION POST] Failed:", err.message));
+
+        console.log("[SIMULATION STOP HOLD]", {
+          lat,
+          lng,
+          currentStopName,
+          nextStopName,
+          remainingMs: s.stopUntil - now,
+        });
+        return;
+      }
+
+      // Post-hold gradual relaunch: pick target, let interpolation handle it
+      if (s.speed < 5 && s.stopUntil <= now && s.speedTarget < 10) {
+        s.speedTarget = getRandomCruiseSpeed();
+        s.speedLastChange = now;
+      }
+
+      // Periodic target refresh (every 8-15 seconds)
+      if (now - s.speedLastChange >= 8000 + Math.random() * 7000) {
+        s.speedTarget = getRandomCruiseSpeed();
+        s.speedLastChange = now;
+      }
+
+      // Smooth speed interpolation with clamped delta per tick
+      const delta = s.speedTarget - s.speedCurrent;
+      const maxDelta = 1.5;
+      let step = delta * 0.08;
+      if (step > maxDelta) step = maxDelta;
+      if (step < -maxDelta) step = -maxDelta;
+      s.speedCurrent += step;
+      if (s.speedCurrent < 0) s.speedCurrent = 0;
+      if (s.speedCurrent > 80) s.speedCurrent = 80;
+      s.speed = s.speedCurrent;
+
+      // Update average speed for smooth ETA
+      s.avgSpeed = s.avgSpeed * 0.92 + s.speed * 0.08;
+      if (s.avgSpeed < 0.1) s.avgSpeed = 0;
+
+      // Compute distance to move this tick
+      const speedMps = s.speed / 3.6;
+      const tickSeconds = 0.75;
+      const moveMeters = speedMps * tickSeconds;
+
+      // Advance through dense segments
+      let remainingMove = moveMeters;
+      while (remainingMove > 0 && s.segmentIndex < activeCoords.length - 1) {
+        const segStart = activeCoords[s.segmentIndex];
+        const segEnd = activeCoords[s.segmentIndex + 1];
+        const segDist = haversineMeters(segStart[0], segStart[1], segEnd[0], segEnd[1]);
+        const currentPosInSeg = s.segmentProgress * segDist;
+        const distToSegEnd = segDist - currentPosInSeg;
+
+        if (remainingMove <= distToSegEnd) {
+          s.segmentProgress = (currentPosInSeg + remainingMove) / segDist;
+          remainingMove = 0;
+        } else {
+          remainingMove -= distToSegEnd;
+          s.segmentIndex++;
+          s.segmentProgress = 0;
+        }
+      }
+
+      // Clamp at end of route
+      if (s.segmentIndex >= activeCoords.length - 1) {
+        s.segmentIndex = activeCoords.length - 1;
+        s.segmentProgress = 0;
+      }
+
+      // Interpolate current position from dense coords
+      const c0 = activeCoords[s.segmentIndex];
+      const c1 = activeCoords[Math.min(s.segmentIndex + 1, activeCoords.length - 1)];
+      const lat = c0[0] + (c1[0] - c0[0]) * s.segmentProgress;
+      const lng = c0[1] + (c1[1] - c0[1]) * s.segmentProgress;
+
+      // Current and next stop (from stops array, not coords)
+      const currentStop = activeStops[s.currentStopIndex];
+      const nextStop = activeStops[s.currentStopIndex + 1];
+      const currentStopName = currentStop?.name || null;
+      const nextStopName = nextStop?.name || null;
+
+      // Distance to next stop for arrival detection
+      let distToNextStop = Infinity;
+      if (nextStop) {
+        distToNextStop = haversineMeters(lat, lng, nextStop.lat, nextStop.lng);
+      }
+
+      // Arrival logic: within 35m of next stop — edge-triggered, hold once per stop
+      if (distToNextStop < 35 && nextStop) {
+        if (s.currentStopIndex !== s.lastHeldStopIndex) {
+          s.stopUntil = now + 5000;
+          s.speed = 0;
+          s.speedCurrent = 0;
+          s.speedTarget = 0;
+          s.avgSpeed = 0;
+          s.lastHeldStopIndex = s.currentStopIndex;
+          s.currentStopIndex++;
+
+          console.log("[SIMULATION ARRIVAL]", {
+            stopName: nextStop.name,
+            currentStopIndex: s.currentStopIndex,
+            direction: s.direction,
+          });
+        }
+
+        // Reached final stop: reverse direction
+        if (s.currentStopIndex >= activeStops.length - 1) {
+          console.log("[SIMULATION END OF ROUTE] Reversing direction");
+          const newDirection = s.direction === "OUTBOUND" ? "INBOUND" : "OUTBOUND";
+          s.direction = newDirection;
+          s.currentStopIndex = 0;
+          s.lastHeldStopIndex = -1;
+          s.segmentIndex = 0;
+          s.segmentProgress = 0;
+          s.targetSpeed = 35;
+          s.speedCurrent = 0;
+          s.speedTarget = 35;
+          s.speedLastChange = 0;
+          s.avgSpeed = 0;
+          s.etaSmoothed = null;
+
+          // Notify backend so progression engine uses reversed stops / coords
+          fetch(`${API_BASE_URL}/api/location/start`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(token && { "Authorization": `Bearer ${token}` }),
+            },
+            body: JSON.stringify({
+              busId,
+              lat: lat,
+              lng: lng,
+              routeId: route.id,
+              routeName: route.name,
+              routeColor: route.color,
+              direction: newDirection,
+            }),
+          }).catch((err) => console.log("[SIMULATION DIRECTION] Failed:", err.message));
+        }
+      } else if (distToNextStop > MAX_STOP_DISTANCE_METERS && nextStop) {
+        // Off-route stop: skip silently if bus is now closer to the next-next stop
+        const nextNextStop = activeStops[s.currentStopIndex + 2];
+        if (nextNextStop) {
+          const distToNextNext = haversineMeters(lat, lng, nextNextStop.lat, nextNextStop.lng);
+          if (distToNextNext < distToNextStop) {
+            s.currentStopIndex++;
+            console.log("[SIMULATION SKIP OFF-ROUTE]", {
+              skipped: nextStop.name,
+              distance: Math.round(distToNextStop),
+            });
+            // Re-evaluate if we hit the final stop after skipping
+            if (s.currentStopIndex >= activeStops.length - 1) {
+              console.log("[SIMULATION END OF ROUTE] Reversing direction after skip");
+              const newDirection = s.direction === "OUTBOUND" ? "INBOUND" : "OUTBOUND";
+              s.direction = newDirection;
+              s.currentStopIndex = 0;
+              s.segmentIndex = 0;
+              s.segmentProgress = 0;
+              s.targetSpeed = 35;
+              s.speedCurrent = 0;
+              s.speedTarget = 35;
+              s.speedLastChange = 0;
+              s.avgSpeed = 0;
+              s.etaSmoothed = null;
+
+              // Notify backend so progression engine uses reversed stops / coords
+              fetch(`${API_BASE_URL}/api/location/start`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  ...(token && { "Authorization": `Bearer ${token}` }),
+                },
+                body: JSON.stringify({
+                  busId,
+                  lat: lat,
+                  lng: lng,
+                  routeId: route.id,
+                  routeName: route.name,
+                  routeColor: route.color,
+                  direction: newDirection,
+                }),
+              }).catch((err) => console.log("[SIMULATION DIRECTION] Failed:", err.message));
+            }
+          }
+        }
+      }
+
+      // ETA based on final destination using simulatedSpeed only
+      const remainingDistanceMeters = computeRemainingDistanceMeters(activeCoords, s.segmentIndex, s.segmentProgress);
+      const remainingKm = remainingDistanceMeters / 1000;
+      let nextStopEtaMinutes = null;
+      if (remainingKm <= 0.05) {
+        nextStopEtaMinutes = 0;
+      } else if (s.speed > 1) {
+        const rawEta = (remainingKm / s.speed) * 60;
+        let newEta = Math.max(0, Math.round(rawEta));
+        if (s.etaSmoothed === null) {
+          s.etaSmoothed = newEta;
+        } else {
+          s.etaSmoothed = s.etaSmoothed * 0.7 + newEta * 0.3;
+        }
+        nextStopEtaMinutes = Math.round(s.etaSmoothed);
+      }
+
+      // Route progress index = nearest dense coordinate
+      const routeProgressIndex = Math.min(
+        activeCoords.length - 1,
+        s.segmentIndex
+      );
+
+      const derivedSpeed = Math.round(s.speed / 3.6);
+
+      // POST to backend so progression engine computes stops / ETA for all clients
+      fetch(`${API_BASE_URL}/api/driver/location`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token && { "Authorization": `Bearer ${token}` }),
+        },
+        body: JSON.stringify({
+          busId,
+          lat: lat,
+          lng: lng,
+          speed: derivedSpeed,
+          remainingDistanceMeters,
+          source: "simulation",
+          trackingActive: true,
+        }),
+      }).catch((err) => console.log("[SIMULATION POST] Failed:", err.message));
+
+      console.log("[SIMULATION EMIT]", {
+        lat,
+        lng,
+        currentStopName,
+        nextStopName,
+        nextStopEtaMinutes,
+        routeProgressIndex,
+        speedKmh: Math.round(s.speed * 10) / 10,
+        derivedSpeed,
+        direction: s.direction,
+      });
+    }, 750);
+
+    devSimIntervalRef.current = interval;
+    return () => clearInterval(interval);
   }, []);
 
   // Call backend to start tracking
@@ -835,6 +1351,12 @@ export default function DriverTrackingScreen({
           distanceInterval: MIN_DISTANCE_METERS, // Minimum 10m movement
         },
         (location) => {
+          // DEV: Real GPS blocked — simulation interval owns all sends
+          if (DEV_ROUTE_SIMULATION) {
+            console.log("[DEV GPS] Real GPS ignored");
+            return;
+          }
+
           const { latitude, longitude } = location.coords;
           setCurrentLocation({ latitude, longitude });
           console.log("DRIVER LOCATION:", latitude.toFixed(6), longitude.toFixed(6));
@@ -850,6 +1372,25 @@ export default function DriverTrackingScreen({
       firstUpdateAfterStartRef.current = true;
       lastSendTimeRef.current = 0; // DEBUG: ensure first GPS update is never blocked
       global.__trackingActive = true;
+      await AsyncStorage.setItem("trackingActive", "true");
+
+      // DEV ONLY: Reset simulation state for realistic startup
+      if (DEV_ROUTE_SIMULATION) {
+        simulationRef.current.segmentIndex = 0;
+        simulationRef.current.segmentProgress = 0;
+        simulationRef.current.currentStopIndex = 0;
+        simulationRef.current.speed = 0;
+        simulationRef.current.avgSpeed = 0;
+        simulationRef.current.targetSpeed = 35;
+        simulationRef.current.speedCurrent = 0;
+        simulationRef.current.speedTarget = 35;
+        simulationRef.current.speedLastChange = 0;
+        simulationRef.current.stopUntil = 0;
+        simulationRef.current.lastHeldStopIndex = -1;
+        simulationRef.current.etaSmoothed = null;
+        simulationRef.current.initialStopHoldUntil = Date.now() + 4000;
+        console.log("[SIMULATION] Reset state with 4s startup hold");
+      }
 
       // Transition to active state
       trackingLifecycleRef.current = "active";
@@ -863,6 +1404,11 @@ export default function DriverTrackingScreen({
         // GUARD: Don't send if tracking stopped
         if (!global.__trackingActive) {
           console.log("[TRACKING] Guaranteed update cancelled - tracking stopped");
+          return;
+        }
+        // DEV SIMULATION BLOCK: do not fetch real GPS during demo mode
+        if (DEV_ROUTE_SIMULATION) {
+          console.log("[TRACKING] Guaranteed update blocked - simulation mode");
           return;
         }
         try {
@@ -918,6 +1464,7 @@ export default function DriverTrackingScreen({
 
     // HARD SHUTDOWN: Block all sends immediately BEFORE any async work
     global.__trackingActive = false;
+    AsyncStorage.removeItem("trackingActive").catch(() => {});
     console.log("[STOP] trackingActiveRef = false (hard shutdown)");
 
     if (locationSubscriptionRef.current) {

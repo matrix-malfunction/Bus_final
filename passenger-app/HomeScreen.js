@@ -30,10 +30,6 @@ import { fetchNearbyBuses, expandBusData } from "./api/busApi";
 
 import { useBus } from "./BusContext";
 
-import Speedometer from "./components/Speedometer";
-
-
-
 const API_BASE_URL = "https://bus-tracking-backend-6htm.onrender.com";
 
 const DEFAULT_CENTER = { latitude: 13.1044, longitude: 79.9079 };
@@ -2091,10 +2087,6 @@ const HomeScreen = () => {
 
   
 
-  // Get followed bus data for speedometer
-
-  const followedBus = followBusId ? buses[followBusId] : null;
-
   const [sosAlerts, setSosAlerts] = useState([]);
 
   const webViewRef = useRef(null);
@@ -3202,22 +3194,6 @@ const HomeScreen = () => {
         </View>
 
       </ScrollView>
-
-      
-
-      {/* Speedometer Overlay - only visible when following a bus */}
-
-      {followBusId && followedBus && (
-
-        <Speedometer
-
-          key={followBusId}
-
-          speed={Number.isFinite(followedBus.derivedSpeed) ? followedBus.derivedSpeed : (followedBus.speed ? Math.round(followedBus.speed * 3.6) : 0)}
-
-        />
-
-      )}
 
     </SafeAreaView>
 

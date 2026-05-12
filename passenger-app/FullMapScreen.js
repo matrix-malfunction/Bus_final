@@ -1252,23 +1252,6 @@ export default function FullMapScreen({ route }) {
       </head>
       <body>
         <div id="map"></div>
-        <!-- Speedometer overlay - shows speed of followed bus -->
-        <div id="speedometer" style="
-          position: absolute;
-          left: 12px;
-          bottom: 20px;
-          z-index: 9999;
-          background: rgba(0,0,0,0.7);
-          color: white;
-          padding: 8px 12px;
-          border-radius: 10px;
-          font-size: 14px;
-          font-weight: bold;
-          backdrop-filter: blur(6px);
-          display: none;
-        ">
-          Speed: -- km/h
-        </div>
         <button id="recenter-btn">
           <svg width="22" height="22" viewBox="0 0 24 24">
             <path d="M12 8a4 4 0 100 8 4 4 0 000-8zm0-6v2a8 8 0 018 8h2A10 10 0 0012 2zm0 20v-2a8 8 0 01-8-8H2a10 10 0 0010 10zm10-10h-2a8 8 0 01-8 8v2a10 10 0 0010-10zM2 12h2a8 8 0 018-8V2A10 10 0 002 12z"/>
@@ -1392,7 +1375,7 @@ export default function FullMapScreen({ route }) {
             window.__followBusId = null;
             window.userLocation = null;
             window.__pendingBusStopRender = false;
-            window.__busAnimations = {}; // RAF animation tracking per bus
+            window.busAnimations = {}; // RAF animation tracking per bus
             window.activeRouteLine = null; // Single active route polyline
             window.highlightedStopMarker = null; // Single highlighted stop marker
 
@@ -1469,15 +1452,16 @@ export default function FullMapScreen({ route }) {
             
             // Cancel existing animation for a bus
             function cancelBusAnimation(busId) {
-              if (window.__busAnimations[busId]) {
-                cancelAnimationFrame(window.__busAnimations[busId].rafId);
-                delete window.__busAnimations[busId];
+              if (window.busAnimations[busId]) {
+                cancelAnimationFrame(window.busAnimations[busId].rafId);
+                delete window.busAnimations[busId];
               }
             }
             
-            // Smooth marker position animation with teleport protection
-            function animateBusMarker(busId, marker, targetLat, targetLng, duration) {
-              duration = duration || 800; // Default 800ms for smooth transit feel
+            // Production-safe smooth marker interpolation
+            // Signature: animateMarker(marker, busId, targetLat, targetLng, duration)
+            function animateMarker(marker, busId, targetLat, targetLng, duration) {
+              duration = duration || 1200; // Default 1200ms for smooth transit feel
 
               if (!marker || !marker.setLatLng) {
                 console.log("[ANIMATE] Invalid marker", busId);
@@ -1488,9 +1472,9 @@ export default function FullMapScreen({ route }) {
               const startLat = currentLatLng.lat;
               const startLng = currentLatLng.lng;
               
-              // GPS Teleport Protection: Skip animation if distance is too large
+              // GPS Teleport Protection: Skip animation if jump is too large (>500m)
               const distance = haversineDistance(startLat, startLng, targetLat, targetLng);
-              if (distance > TELEPORT_THRESHOLD_METERS) {
+              if (distance > 500) {
                 marker.setLatLng([targetLat, targetLng]);
                 return;
               }
@@ -1510,8 +1494,10 @@ export default function FullMapScreen({ route }) {
                 const elapsed = currentTime - startTime;
                 const progress = Math.min(elapsed / duration, 1);
 
-                // Easing function: easeOutCubic for natural deceleration
-                const eased = 1 - Math.pow(1 - progress, 3);
+                // Easing function: easeInOutCubic for smooth acceleration + deceleration
+                const eased = progress < 0.5
+                  ? 4 * progress * progress * progress
+                  : 1 - Math.pow(-2 * progress + 2, 3) / 2;
 
                 const newLat = startLat + (targetLat - startLat) * eased;
                 const newLng = startLng + (targetLng - startLng) * eased;
@@ -1519,16 +1505,16 @@ export default function FullMapScreen({ route }) {
                 marker.setLatLng([newLat, newLng]);
                 
                 if (progress < 1) {
-                  window.__busAnimations[busId] = {
+                  window.busAnimations[busId] = {
                     rafId: requestAnimationFrame(step),
                     startLat, startLng, targetLat, targetLng
                   };
                 } else {
-                  delete window.__busAnimations[busId];
+                  delete window.busAnimations[busId];
                 }
               }
               
-              window.__busAnimations[busId] = {
+              window.busAnimations[busId] = {
                 rafId: requestAnimationFrame(step),
                 startLat, startLng, targetLat, targetLng
               };
@@ -1546,7 +1532,7 @@ export default function FullMapScreen({ route }) {
                 console.log("[POSITION] Invalid update", { busId, lat, lng });
                 return;
               }
-              animateBusMarker(busId, marker, lat, lng, 800);
+              animateMarker(marker, busId, lat, lng, 1200);
             }
             
             // Update heading direction with smooth rotation
@@ -1721,31 +1707,6 @@ export default function FullMapScreen({ route }) {
             }
 
             // 3a) CREATE POPUP HTML (dynamic follow/unfollow)
-            // SPEEDOMETER UPDATE FUNCTION - Backend-authoritative speed only
-            function updateSpeedometer(busData) {
-              if (!busData) return;
-              
-              // Use backend-derived speed (stable) with fallback to raw GPS speed
-              const displaySpeed = Number.isFinite(busData.derivedSpeed)
-                ? Math.round(busData.derivedSpeed)
-                : Math.round((busData.speed || 0) * 3.6);
-              
-              const el = document.getElementById('speedometer');
-              if (!el) return;
-              
-              el.innerHTML = 'Speed: ' + displaySpeed + ' km/h';
-              el.style.display = 'block';
-            }
-            
-            // SPEEDOMETER RESET FUNCTION
-            function resetSpeedometer() {
-              const el = document.getElementById('speedometer');
-              if (el) {
-                el.innerHTML = 'Speed: -- km/h';
-                el.style.display = 'none';
-              }
-            }
-
             // Route-aware popup with bus metadata and progression
             function createPopupHTML(bus) {
               const speed = bus.derivedSpeed ?? bus.speed ?? 0;
@@ -1770,6 +1731,9 @@ export default function FullMapScreen({ route }) {
                   '</div>' +
                   '<div style="margin-top:4px;">' +
                     '<strong>Speed:</strong> ' + safeSpeed + ' km/h' +
+                  '</div>' +
+                  '<div style="margin-top:4px;">' +
+                    '<strong>Occupancy:</strong> ' + Math.round(((bus.occupancy || 0) / (bus.capacity || 50)) * 100) + '%' +
                   '</div>' +
                   '<div style="margin-top:4px;">' +
                     '<strong>Current Stop:</strong> ' + currentStop +
@@ -1931,10 +1895,6 @@ export default function FullMapScreen({ route }) {
                     updateBusFollowState(marker, isFollowing);
                     marker.__isFollowing = isFollowing;
                     
-                    // Update speedometer when follow state changes
-                    if (isFollowing && (bus.derivedSpeed !== undefined || bus.speed !== undefined)) {
-                      updateSpeedometer(bus);
-                    }
                   }
                   
                   // 7. Update SOS state (if changed)
@@ -2070,7 +2030,6 @@ export default function FullMapScreen({ route }) {
                   if (window.__followBusId === id) {
                     updateBusFollowState(marker, true);
                     marker.__isFollowing = true;
-                    updateSpeedometer(busData);
                   }
                   
                   // Update ETA if available
@@ -2121,11 +2080,11 @@ export default function FullMapScreen({ route }) {
               });
             }
 
-            // EVENT-DRIVEN FOLLOW with 500ms throttle
+            // EVENT-DRIVEN FOLLOW with 1000ms throttle
             let lastFollowTime = 0;
             function throttledFollow(lat, lng) {
               const now = Date.now();
-              if (now - lastFollowTime < 500) return; // Throttle: max once per 500ms
+              if (now - lastFollowTime < 1000) return; // Throttle: max once per 1000ms
               lastFollowTime = now;
               
               if (!window.map || !window.__followBusId || window.__isUserInteracting) return;
@@ -3567,7 +3526,6 @@ window.map.on("zoomend", function() {
                     console.log(
                       "[WEBVIEW FULLMAP] FOLLOW cleared"
                     );
-                    resetSpeedometer();
                     break;
                   }
 
@@ -3705,7 +3663,6 @@ window.map.on("zoomend", function() {
                   // Clear follow ONLY if this bus was being followed
                   if (window.__followBusId === data.busId) {
                     window.__followBusId = null;
-                    resetSpeedometer();
                     console.log("[WEBVIEW] Cleared follow for offline bus:", data.busId);
                   }
                   break;
@@ -3730,7 +3687,6 @@ window.map.on("zoomend", function() {
                   // Clear follow if this bus was being followed
                   if (window.__followBusId === sosBusId) {
                     window.__followBusId = null;
-                    resetSpeedometer();
                     console.log("[WEBVIEW] SOS_TRIGGERED: cleared follow", sosBusId);
                   }
                   
