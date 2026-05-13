@@ -150,6 +150,7 @@ export default function FullMapScreen({ route }) {
             direction: b.direction,
             derivedSpeed: b.derivedSpeed,
             speed: b.speed,
+            occupancy: b.occupancy,
           })));
 
           webViewRef.current.postMessage(
@@ -298,6 +299,7 @@ export default function FullMapScreen({ route }) {
       direction: b.direction,
       derivedSpeed: b.derivedSpeed,
       speed: b.speed,
+      occupancy: b.occupancy,
     })));
     webViewRef.current.postMessage(
       JSON.stringify({
@@ -1733,7 +1735,7 @@ export default function FullMapScreen({ route }) {
                     '<strong>Speed:</strong> ' + safeSpeed + ' km/h' +
                   '</div>' +
                   '<div style="margin-top:4px;">' +
-                    '<strong>Occupancy:</strong> ' + Math.round(((bus.occupancy || 0) / (bus.capacity || 50)) * 100) + '%' +
+                    '<strong>Occupancy:</strong> ' + (bus.occupancy || "UNKNOWN") +
                   '</div>' +
                   '<div style="margin-top:4px;">' +
                     '<strong>Current Stop:</strong> ' + currentStop +

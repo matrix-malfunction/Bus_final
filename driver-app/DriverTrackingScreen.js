@@ -28,11 +28,12 @@ const BUS_ID_KEY = "bus_id";
 const TOKEN_KEY = "@auth_token";
 
 // ─────────────────────────────────────────────
-// DEV-ONLY: Fake GPS injector for route corridor testing
-// ⚠️  Set DEV_ROUTE_SIMULATION = false before production build
+// TRACKING MODE: REAL uses GPS, DEMO uses simulation
 // ─────────────────────────────────────────────
-const DEV_ROUTE_SIMULATION = true;
-global.__devRouteSimulation = DEV_ROUTE_SIMULATION; // Expose for background task guard
+const TRACKING_MODE = { REAL: "REAL", DEMO: "DEMO" };
+const DEFAULT_TRACKING_MODE = TRACKING_MODE.REAL;
+
+global.__trackingMode = DEFAULT_TRACKING_MODE; // Expose for background task
 
 // Demo-safe: stops farther than this from route are skipped silently
 const MAX_STOP_DISTANCE_METERS = 120;
@@ -291,12 +292,6 @@ TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
       return;
     }
 
-    // DEV SIMULATION BLOCK: do not emit real GPS during demo mode
-    if (global.__devRouteSimulation) {
-      console.log("[BG TASK] BLOCKED - simulation mode active");
-      return;
-    }
-
     // Build request body without fallbacks
     const requestBody = {
       busId,
@@ -385,7 +380,8 @@ export default function DriverTrackingScreen({
   routeId, 
   routeName, 
   routeColor, 
-  direction 
+  direction,
+  occupancy = "MEDIUM"
 }) {
   const navigation = useNavigation();
   
@@ -395,6 +391,7 @@ export default function DriverTrackingScreen({
     routeName,
     routeColor,
     direction,
+    occupancy,
   });
   
   const [busId, setBusId] = useState("BUS101");
@@ -418,6 +415,7 @@ export default function DriverTrackingScreen({
   const trackingStartInFlightRef = useRef(false); // Prevent duplicate tracking starts
   const trackingLifecycleRef = useRef("idle"); // idle | starting | active | stopping
   const firstUpdateAfterStartRef = useRef(false); // Allow first GPS update even with weak accuracy
+  const trackingModeRef = useRef(DEFAULT_TRACKING_MODE);
   const simulationRef = useRef({
     segmentIndex: 0,
     segmentProgress: 0,
@@ -432,6 +430,7 @@ export default function DriverTrackingScreen({
     lastHeldStopIndex: -1,
     avgSpeed: 0,
     etaSmoothed: null,
+    occupancy: occupancy || "MEDIUM",
     direction: direction || "OUTBOUND",
   });
   const routeDataRef = useRef(null);
@@ -616,12 +615,6 @@ export default function DriverTrackingScreen({
       return;
     }
 
-    // DEV SIMULATION BLOCK: do not emit real GPS during demo mode
-    if (DEV_ROUTE_SIMULATION) {
-      console.log("[API] BLOCKED - simulation mode active");
-      return;
-    }
-
     let { latitude, longitude, accuracy, altitude, heading } = location;
 
     // GPS DRIFT FILTER: Skip low accuracy locations (>50m)
@@ -733,6 +726,7 @@ export default function DriverTrackingScreen({
         altitude: altitude || null,
         heading: heading || null,
         speed: finalSpeed, // Computed speed (Haversine), not GPS
+        occupancy: simulationRef.current?.occupancy || "MEDIUM",
         source: isFromQueue ? "queue_retry" : "watch_position",
         timestamp: new Date().toISOString(),
         trackingActive: global.__trackingActive, // Dynamic tracking state
@@ -819,12 +813,6 @@ export default function DriverTrackingScreen({
       return;
     }
 
-    // DEV SIMULATION BLOCK: do not flush real GPS during demo mode
-    if (DEV_ROUTE_SIMULATION) {
-      console.log("[QUEUE] Flush blocked - simulation mode active");
-      return;
-    }
-    
     if (failedQueue.length === 0 || flushInProgressRef.current) return;
 
     flushInProgressRef.current = true;
@@ -862,9 +850,9 @@ export default function DriverTrackingScreen({
     return () => socket.disconnect();
   }, []);
 
-  // Fetch full route details (stops + routeCoords) for simulation
+  // Fetch full route details (stops + routeCoords) for progression / snapping
   useEffect(() => {
-    if (!DEV_ROUTE_SIMULATION || !routeId) return;
+    if (!routeId) return;
 
     fetch(`${API_BASE_URL}/api/routes/${routeId}`)
       .then((res) => res.json())
@@ -895,352 +883,6 @@ export default function DriverTrackingScreen({
         }
       })
       .catch((err) => console.log('[SIMULATION] Failed to load route:', err.message));
-  }, []);
-
-  // DEV ONLY: Stop-aware simulation interval
-  useEffect(() => {
-    if (!DEV_ROUTE_SIMULATION) return;
-
-    const interval = setInterval(() => {
-      if (!global.__trackingActive) return;
-
-      const route = routeDataRef.current;
-      const denseCoords = denseCoordsRef.current;
-      if (!route || !route.stops || route.stops.length < 2 || !denseCoords || denseCoords.length < 2) {
-        console.log('[SIM] Invalid route data');
-        return;
-      }
-
-      const s = simulationRef.current;
-      const now = Date.now();
-
-      // Direction-aware copies
-      let activeStops = route.stops;
-      let activeCoords = denseCoords;
-      if (s.direction === "INBOUND") {
-        activeStops = [...route.stops].reverse();
-        activeCoords = [...denseCoords].reverse();
-      }
-
-      console.log('[SIMULATION TICK]', {
-        trackingActive: global.__trackingActive,
-        denseCoordsLength: activeCoords.length,
-        stopsLength: activeStops.length,
-        segmentIndex: s.segmentIndex,
-        segmentProgress: Math.round(s.segmentProgress * 1000) / 1000,
-        currentStopIndex: s.currentStopIndex,
-        direction: s.direction,
-        speed: Math.round(s.speed * 10) / 10,
-        avgSpeed: Math.round(s.avgSpeed * 10) / 10,
-      });
-
-      // INITIAL STOP HOLD: bus sits at first stop for realistic startup
-      if (s.initialStopHoldUntil > now) {
-        const stop = activeStops[s.currentStopIndex];
-        const lat = stop ? stop.lat : activeCoords[0][0];
-        const lng = stop ? stop.lng : activeCoords[0][1];
-        const nextStop = activeStops[s.currentStopIndex + 1];
-        const currentStopName = stop?.name || null;
-        const nextStopName = nextStop?.name || null;
-
-        // POST during initial hold
-        const initialHoldRemaining = computeRemainingDistanceMeters(activeCoords, s.segmentIndex, s.segmentProgress);
-        fetch(`${API_BASE_URL}/api/driver/location`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(token && { "Authorization": `Bearer ${token}` }),
-          },
-          body: JSON.stringify({
-            busId,
-            lat: lat,
-            lng: lng,
-            speed: 0,
-            remainingDistanceMeters: initialHoldRemaining,
-            source: "simulation",
-            trackingActive: true,
-          }),
-        }).catch((err) => console.log("[SIMULATION POST] Failed:", err.message));
-
-        console.log("[SIMULATION STARTUP HOLD]", {
-          currentStopName,
-          nextStopName,
-          remainingMs: s.initialStopHoldUntil - now,
-        });
-        return;
-      }
-
-      // STOP HOLD: paused at a stop
-      if (s.stopUntil > now) {
-        const stop = activeStops[s.currentStopIndex];
-        const lat = stop ? stop.lat : activeCoords[0][0];
-        const lng = stop ? stop.lng : activeCoords[0][1];
-        const nextStop = activeStops[s.currentStopIndex + 1];
-        const currentStopName = stop?.name || null;
-        const nextStopName = nextStop?.name || null;
-
-        // POST during stop hold
-        const stopHoldRemaining = computeRemainingDistanceMeters(activeCoords, s.segmentIndex, s.segmentProgress);
-        fetch(`${API_BASE_URL}/api/driver/location`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(token && { "Authorization": `Bearer ${token}` }),
-          },
-          body: JSON.stringify({
-            busId,
-            lat: lat,
-            lng: lng,
-            speed: 0,
-            remainingDistanceMeters: stopHoldRemaining,
-            source: "simulation",
-            trackingActive: true,
-          }),
-        }).catch((err) => console.log("[SIMULATION POST] Failed:", err.message));
-
-        console.log("[SIMULATION STOP HOLD]", {
-          lat,
-          lng,
-          currentStopName,
-          nextStopName,
-          remainingMs: s.stopUntil - now,
-        });
-        return;
-      }
-
-      // Post-hold gradual relaunch: pick target, let interpolation handle it
-      if (s.speed < 5 && s.stopUntil <= now && s.speedTarget < 10) {
-        s.speedTarget = getRandomCruiseSpeed();
-        s.speedLastChange = now;
-      }
-
-      // Periodic target refresh (every 8-15 seconds)
-      if (now - s.speedLastChange >= 8000 + Math.random() * 7000) {
-        s.speedTarget = getRandomCruiseSpeed();
-        s.speedLastChange = now;
-      }
-
-      // Smooth speed interpolation with clamped delta per tick
-      const delta = s.speedTarget - s.speedCurrent;
-      const maxDelta = 1.5;
-      let step = delta * 0.08;
-      if (step > maxDelta) step = maxDelta;
-      if (step < -maxDelta) step = -maxDelta;
-      s.speedCurrent += step;
-      if (s.speedCurrent < 0) s.speedCurrent = 0;
-      if (s.speedCurrent > 80) s.speedCurrent = 80;
-      s.speed = s.speedCurrent;
-
-      // Update average speed for smooth ETA
-      s.avgSpeed = s.avgSpeed * 0.92 + s.speed * 0.08;
-      if (s.avgSpeed < 0.1) s.avgSpeed = 0;
-
-      // Compute distance to move this tick
-      const speedMps = s.speed / 3.6;
-      const tickSeconds = 0.75;
-      const moveMeters = speedMps * tickSeconds;
-
-      // Advance through dense segments
-      let remainingMove = moveMeters;
-      while (remainingMove > 0 && s.segmentIndex < activeCoords.length - 1) {
-        const segStart = activeCoords[s.segmentIndex];
-        const segEnd = activeCoords[s.segmentIndex + 1];
-        const segDist = haversineMeters(segStart[0], segStart[1], segEnd[0], segEnd[1]);
-        const currentPosInSeg = s.segmentProgress * segDist;
-        const distToSegEnd = segDist - currentPosInSeg;
-
-        if (remainingMove <= distToSegEnd) {
-          s.segmentProgress = (currentPosInSeg + remainingMove) / segDist;
-          remainingMove = 0;
-        } else {
-          remainingMove -= distToSegEnd;
-          s.segmentIndex++;
-          s.segmentProgress = 0;
-        }
-      }
-
-      // Clamp at end of route
-      if (s.segmentIndex >= activeCoords.length - 1) {
-        s.segmentIndex = activeCoords.length - 1;
-        s.segmentProgress = 0;
-      }
-
-      // Interpolate current position from dense coords
-      const c0 = activeCoords[s.segmentIndex];
-      const c1 = activeCoords[Math.min(s.segmentIndex + 1, activeCoords.length - 1)];
-      const lat = c0[0] + (c1[0] - c0[0]) * s.segmentProgress;
-      const lng = c0[1] + (c1[1] - c0[1]) * s.segmentProgress;
-
-      // Current and next stop (from stops array, not coords)
-      const currentStop = activeStops[s.currentStopIndex];
-      const nextStop = activeStops[s.currentStopIndex + 1];
-      const currentStopName = currentStop?.name || null;
-      const nextStopName = nextStop?.name || null;
-
-      // Distance to next stop for arrival detection
-      let distToNextStop = Infinity;
-      if (nextStop) {
-        distToNextStop = haversineMeters(lat, lng, nextStop.lat, nextStop.lng);
-      }
-
-      // Arrival logic: within 35m of next stop — edge-triggered, hold once per stop
-      if (distToNextStop < 35 && nextStop) {
-        if (s.currentStopIndex !== s.lastHeldStopIndex) {
-          s.stopUntil = now + 5000;
-          s.speed = 0;
-          s.speedCurrent = 0;
-          s.speedTarget = 0;
-          s.avgSpeed = 0;
-          s.lastHeldStopIndex = s.currentStopIndex;
-          s.currentStopIndex++;
-
-          console.log("[SIMULATION ARRIVAL]", {
-            stopName: nextStop.name,
-            currentStopIndex: s.currentStopIndex,
-            direction: s.direction,
-          });
-        }
-
-        // Reached final stop: reverse direction
-        if (s.currentStopIndex >= activeStops.length - 1) {
-          console.log("[SIMULATION END OF ROUTE] Reversing direction");
-          const newDirection = s.direction === "OUTBOUND" ? "INBOUND" : "OUTBOUND";
-          s.direction = newDirection;
-          s.currentStopIndex = 0;
-          s.lastHeldStopIndex = -1;
-          s.segmentIndex = 0;
-          s.segmentProgress = 0;
-          s.targetSpeed = 35;
-          s.speedCurrent = 0;
-          s.speedTarget = 35;
-          s.speedLastChange = 0;
-          s.avgSpeed = 0;
-          s.etaSmoothed = null;
-
-          // Notify backend so progression engine uses reversed stops / coords
-          fetch(`${API_BASE_URL}/api/location/start`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(token && { "Authorization": `Bearer ${token}` }),
-            },
-            body: JSON.stringify({
-              busId,
-              lat: lat,
-              lng: lng,
-              routeId: route.id,
-              routeName: route.name,
-              routeColor: route.color,
-              direction: newDirection,
-            }),
-          }).catch((err) => console.log("[SIMULATION DIRECTION] Failed:", err.message));
-        }
-      } else if (distToNextStop > MAX_STOP_DISTANCE_METERS && nextStop) {
-        // Off-route stop: skip silently if bus is now closer to the next-next stop
-        const nextNextStop = activeStops[s.currentStopIndex + 2];
-        if (nextNextStop) {
-          const distToNextNext = haversineMeters(lat, lng, nextNextStop.lat, nextNextStop.lng);
-          if (distToNextNext < distToNextStop) {
-            s.currentStopIndex++;
-            console.log("[SIMULATION SKIP OFF-ROUTE]", {
-              skipped: nextStop.name,
-              distance: Math.round(distToNextStop),
-            });
-            // Re-evaluate if we hit the final stop after skipping
-            if (s.currentStopIndex >= activeStops.length - 1) {
-              console.log("[SIMULATION END OF ROUTE] Reversing direction after skip");
-              const newDirection = s.direction === "OUTBOUND" ? "INBOUND" : "OUTBOUND";
-              s.direction = newDirection;
-              s.currentStopIndex = 0;
-              s.segmentIndex = 0;
-              s.segmentProgress = 0;
-              s.targetSpeed = 35;
-              s.speedCurrent = 0;
-              s.speedTarget = 35;
-              s.speedLastChange = 0;
-              s.avgSpeed = 0;
-              s.etaSmoothed = null;
-
-              // Notify backend so progression engine uses reversed stops / coords
-              fetch(`${API_BASE_URL}/api/location/start`, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  ...(token && { "Authorization": `Bearer ${token}` }),
-                },
-                body: JSON.stringify({
-                  busId,
-                  lat: lat,
-                  lng: lng,
-                  routeId: route.id,
-                  routeName: route.name,
-                  routeColor: route.color,
-                  direction: newDirection,
-                }),
-              }).catch((err) => console.log("[SIMULATION DIRECTION] Failed:", err.message));
-            }
-          }
-        }
-      }
-
-      // ETA based on final destination using simulatedSpeed only
-      const remainingDistanceMeters = computeRemainingDistanceMeters(activeCoords, s.segmentIndex, s.segmentProgress);
-      const remainingKm = remainingDistanceMeters / 1000;
-      let nextStopEtaMinutes = null;
-      if (remainingKm <= 0.05) {
-        nextStopEtaMinutes = 0;
-      } else if (s.speed > 1) {
-        const rawEta = (remainingKm / s.speed) * 60;
-        let newEta = Math.max(0, Math.round(rawEta));
-        if (s.etaSmoothed === null) {
-          s.etaSmoothed = newEta;
-        } else {
-          s.etaSmoothed = s.etaSmoothed * 0.7 + newEta * 0.3;
-        }
-        nextStopEtaMinutes = Math.round(s.etaSmoothed);
-      }
-
-      // Route progress index = nearest dense coordinate
-      const routeProgressIndex = Math.min(
-        activeCoords.length - 1,
-        s.segmentIndex
-      );
-
-      const derivedSpeed = Math.round(s.speed / 3.6);
-
-      // POST to backend so progression engine computes stops / ETA for all clients
-      fetch(`${API_BASE_URL}/api/driver/location`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token && { "Authorization": `Bearer ${token}` }),
-        },
-        body: JSON.stringify({
-          busId,
-          lat: lat,
-          lng: lng,
-          speed: derivedSpeed,
-          remainingDistanceMeters,
-          source: "simulation",
-          trackingActive: true,
-        }),
-      }).catch((err) => console.log("[SIMULATION POST] Failed:", err.message));
-
-      console.log("[SIMULATION EMIT]", {
-        lat,
-        lng,
-        currentStopName,
-        nextStopName,
-        nextStopEtaMinutes,
-        routeProgressIndex,
-        speedKmh: Math.round(s.speed * 10) / 10,
-        derivedSpeed,
-        direction: s.direction,
-      });
-    }, 750);
-
-    devSimIntervalRef.current = interval;
-    return () => clearInterval(interval);
   }, []);
 
   // Call backend to start tracking
@@ -1351,12 +993,6 @@ export default function DriverTrackingScreen({
           distanceInterval: MIN_DISTANCE_METERS, // Minimum 10m movement
         },
         (location) => {
-          // DEV: Real GPS blocked — simulation interval owns all sends
-          if (DEV_ROUTE_SIMULATION) {
-            console.log("[DEV GPS] Real GPS ignored");
-            return;
-          }
-
           const { latitude, longitude } = location.coords;
           setCurrentLocation({ latitude, longitude });
           console.log("DRIVER LOCATION:", latitude.toFixed(6), longitude.toFixed(6));
@@ -1374,25 +1010,7 @@ export default function DriverTrackingScreen({
       global.__trackingActive = true;
       await AsyncStorage.setItem("trackingActive", "true");
 
-      // DEV ONLY: Reset simulation state for realistic startup
-      if (DEV_ROUTE_SIMULATION) {
-        simulationRef.current.segmentIndex = 0;
-        simulationRef.current.segmentProgress = 0;
-        simulationRef.current.currentStopIndex = 0;
-        simulationRef.current.speed = 0;
-        simulationRef.current.avgSpeed = 0;
-        simulationRef.current.targetSpeed = 35;
-        simulationRef.current.speedCurrent = 0;
-        simulationRef.current.speedTarget = 35;
-        simulationRef.current.speedLastChange = 0;
-        simulationRef.current.stopUntil = 0;
-        simulationRef.current.lastHeldStopIndex = -1;
-        simulationRef.current.etaSmoothed = null;
-        simulationRef.current.initialStopHoldUntil = Date.now() + 4000;
-        console.log("[SIMULATION] Reset state with 4s startup hold");
-      }
-
-      // Transition to active state
+// Transition to active state
       trackingLifecycleRef.current = "active";
       console.log("[TRACKING] Lifecycle: starting → active");
 
@@ -1404,11 +1022,6 @@ export default function DriverTrackingScreen({
         // GUARD: Don't send if tracking stopped
         if (!global.__trackingActive) {
           console.log("[TRACKING] Guaranteed update cancelled - tracking stopped");
-          return;
-        }
-        // DEV SIMULATION BLOCK: do not fetch real GPS during demo mode
-        if (DEV_ROUTE_SIMULATION) {
-          console.log("[TRACKING] Guaranteed update blocked - simulation mode");
           return;
         }
         try {

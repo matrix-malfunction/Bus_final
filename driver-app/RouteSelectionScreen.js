@@ -14,6 +14,7 @@ import { useNavigation } from "@react-navigation/native";
 const API_BASE_URL = "https://bus-tracking-backend-6htm.onrender.com";
 
 const DIRECTIONS = ["OUTBOUND", "INBOUND"];
+const OCCUPANCIES = ["EMPTY", "LOW", "MEDIUM", "HIGH", "FULL"];
 
 export default function RouteSelectionScreen({ route }) {
   const navigation = useNavigation();
@@ -25,6 +26,7 @@ export default function RouteSelectionScreen({ route }) {
   const [selectedRoute, setSelectedRoute] = useState(null);
   const [selectedDirection, setSelectedDirection] = useState("OUTBOUND");
   const [startingShift, setStartingShift] = useState(false);
+  const [selectedOccupancy, setSelectedOccupancy] = useState("MEDIUM");
 
   // Fetch routes from backend on mount
   useEffect(() => {
@@ -72,6 +74,7 @@ export default function RouteSelectionScreen({ route }) {
       routeName: selectedRoute.name,
       routeColor: selectedRoute.color,
       direction: selectedDirection,
+      occupancy: selectedOccupancy,
     };
     console.log("[ROUTE SELECT NAV]", navParams);
     
@@ -111,6 +114,33 @@ export default function RouteSelectionScreen({ route }) {
       </TouchableOpacity>
     );
   };
+
+  const renderOccupancySelector = () => (
+    <View style={styles.directionContainer}>
+      <Text style={styles.sectionTitle}>Bus Occupancy</Text>
+      <View style={styles.directionButtons}>
+        {OCCUPANCIES.map((occ) => (
+          <TouchableOpacity
+            key={occ}
+            style={[
+              styles.directionButton,
+              selectedOccupancy === occ && styles.directionButtonSelected,
+            ]}
+            onPress={() => setSelectedOccupancy(occ)}
+          >
+            <Text
+              style={[
+                styles.directionButtonText,
+                selectedOccupancy === occ && styles.directionButtonTextSelected,
+              ]}
+            >
+              {occ}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+    </View>
+  );
 
   const renderDirectionSelector = () => (
     <View style={styles.directionContainer}>
@@ -176,6 +206,7 @@ export default function RouteSelectionScreen({ route }) {
         showsVerticalScrollIndicator={false}
       />
 
+      {renderOccupancySelector()}
       {renderDirectionSelector()}
 
       <View style={styles.footer}>

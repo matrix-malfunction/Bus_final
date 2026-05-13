@@ -150,6 +150,7 @@ export function BusProvider({ children }) {
           nextStopEtaMinutes: data.nextStopEtaMinutes ?? prev.nextStopEtaMinutes ?? null,
           remainingDistanceMeters: data.remainingDistanceMeters ?? prev.remainingDistanceMeters ?? null,
           routeProgressIndex: data.routeProgressIndex ?? prev.routeProgressIndex ?? null,
+          occupancy: data.occupancy ?? prev.occupancy ?? "UNKNOWN",
         };
         const newBuses = { ...prevBuses };
         newBuses[data.busId] = busData;
